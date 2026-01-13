@@ -74,6 +74,10 @@ class AlertDispatcher:
         metrics = event.metrics
         timestamp = datetime.fromtimestamp(event.ts / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
 
+        # Get sector name
+        sector = self.config.universe.get_sector_for_symbol(event.initiator_symbol)
+        sector_name = sector.name if sector else "Unknown"
+
         # Format confirmations
         confirmations = []
         if metrics.get('z_oi') and metrics['z_oi'] >= self.config.thresholds.oi_delta_z_confirm:
@@ -86,7 +90,7 @@ class AlertDispatcher:
         confirmations_str = ", ".join(confirmations) if confirmations else "None"
 
         message = f"""🚨 SECTOR SHOT - INITIATOR
-Symbol: {event.initiator_symbol} | Direction: {event.direction.value} | Status: {event.status.value}
+Symbol: {event.initiator_symbol} | Sector: {sector_name} | Direction: {event.direction.value} | Status: {event.status.value}
 Time: {timestamp}
 Z-Scores: ER={metrics['z_er']:.1f}σ, VOL={metrics['z_vol']:.1f}σ
 Taker Buy Share: {metrics['taker_share']:.1%}
@@ -98,11 +102,14 @@ Confirmations: {confirmations_str}"""
     def _format_sector(self, event: Event) -> str:
         """Format sector diffusion alert."""
         timestamp = datetime.fromtimestamp(event.ts / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
-        initiator_ts = datetime.fromtimestamp(event.initiator_symbol / 1000).strftime('%H:%M')
 
+        sector_name = event.metrics.get('sector_name', 'Unknown')
         follower_count = event.metrics.get('follower_count', 0)
-        total_sector = len(self.config.universe.sector_symbols) - 1
         follower_share = event.metrics.get('follower_share', 0)
+
+        # Get sector to calculate total_sector correctly
+        sector = self.config.universe.get_sector_for_symbol(event.initiator_symbol)
+        total_sector = (len(sector.symbols) - 1) if sector else 0
 
         # Format follower list
         follower_lines = []
@@ -113,6 +120,7 @@ Confirmations: {confirmations_str}"""
         followers_str = "\n".join(follower_lines)
 
         message = f"""🎯 SECTOR DIFFUSION DETECTED
+Sector: {sector_name}
 Initiator: {event.initiator_symbol} ({event.direction.value}) at {timestamp}
 Followers ({follower_count}/{total_sector} = {follower_share:.0%}):
 {followers_str}"""

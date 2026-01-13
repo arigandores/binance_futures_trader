@@ -19,15 +19,56 @@ class ApiConfig:
 
 
 @dataclass
+class SectorConfig:
+    """Single sector configuration."""
+    name: str
+    symbols: List[str]
+
+    def __post_init__(self):
+        """Validate sector configuration."""
+        if not self.name:
+            raise ValueError("Sector name cannot be empty")
+        if not self.symbols:
+            raise ValueError(f"Sector '{self.name}' must have at least one symbol")
+
+
+@dataclass
 class UniverseConfig:
     """Symbol universe configuration."""
     benchmark_symbol: str = "BTCUSDT"
-    sector_symbols: List[str] = field(default_factory=lambda: ["ZECUSDT", "DASHUSDT", "XMRUSDT"])
+    sectors: List[SectorConfig] = field(default_factory=lambda: [
+        SectorConfig(name="Privacy", symbols=["ZECUSDT", "DASHUSDT", "XMRUSDT"])
+    ])
 
     @property
     def all_symbols(self) -> List[str]:
-        """Get all symbols (benchmark + sector)."""
-        return [self.benchmark_symbol] + self.sector_symbols
+        """Get all symbols (benchmark + all sectors)."""
+        sector_symbols = []
+        for sector in self.sectors:
+            sector_symbols.extend(sector.symbols)
+        return [self.benchmark_symbol] + sector_symbols
+
+    @property
+    def sector_symbols(self) -> List[str]:
+        """Get all sector symbols (for backward compatibility)."""
+        symbols = []
+        for sector in self.sectors:
+            symbols.extend(sector.symbols)
+        return symbols
+
+    def get_sector_for_symbol(self, symbol: str) -> Optional[SectorConfig]:
+        """Get the sector config for a given symbol."""
+        for sector in self.sectors:
+            if symbol in sector.symbols:
+                return sector
+        return None
+
+    def get_sector_symbols(self, symbol: str) -> List[str]:
+        """Get all symbols in the same sector as the given symbol."""
+        sector = self.get_sector_for_symbol(symbol)
+        if sector:
+            return sector.symbols
+        return []
 
 
 @dataclass
@@ -123,7 +164,19 @@ class Config:
             config.api = ApiConfig(**data['api'])
 
         if 'universe' in data:
-            config.universe = UniverseConfig(**data['universe'])
+            universe_data = data['universe']
+            # Parse sectors if present
+            if 'sectors' in universe_data:
+                sectors = []
+                for sector_data in universe_data['sectors']:
+                    sectors.append(SectorConfig(**sector_data))
+                universe_data['sectors'] = sectors
+            # Support old format (sector_symbols) for backward compatibility
+            elif 'sector_symbols' in universe_data:
+                sectors = [SectorConfig(name="Default", symbols=universe_data['sector_symbols'])]
+                universe_data['sectors'] = sectors
+                del universe_data['sector_symbols']
+            config.universe = UniverseConfig(**universe_data)
 
         if 'windows' in data:
             config.windows = WindowsConfig(**data['windows'])
@@ -155,8 +208,16 @@ class Config:
         if not self.universe.benchmark_symbol:
             raise ValueError("benchmark_symbol cannot be empty")
 
-        if not self.universe.sector_symbols:
-            raise ValueError("sector_symbols cannot be empty")
+        if not self.universe.sectors:
+            raise ValueError("At least one sector must be configured")
+
+        # Check for duplicate symbols across sectors
+        all_sector_symbols = []
+        for sector in self.universe.sectors:
+            for symbol in sector.symbols:
+                if symbol in all_sector_symbols:
+                    raise ValueError(f"Symbol {symbol} appears in multiple sectors")
+                all_sector_symbols.append(symbol)
 
         # Check windows
         if self.windows.bar_interval_sec <= 0:

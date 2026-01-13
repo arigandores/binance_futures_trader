@@ -192,6 +192,7 @@ class AnomalyDetector:
         Check if this feature qualifies as a follower for pending sector events.
 
         Simplified signal: z_er_15m >= 2.0 AND z_vol_15m >= 2.0 AND same direction.
+        Only checks followers within the same sector as the initiator.
         """
         # Clean up expired pending events
         expired_symbols = [
@@ -207,8 +208,13 @@ class AnomalyDetector:
             if features.symbol == initiator_symbol:
                 continue
 
-            # Skip if outside sector
-            if features.symbol not in self.config.universe.sector_symbols:
+            # Get initiator's sector
+            initiator_sector = self.config.universe.get_sector_for_symbol(initiator_symbol)
+            if not initiator_sector:
+                continue
+
+            # Skip if follower is not in the same sector as initiator
+            if features.symbol not in initiator_sector.symbols:
                 continue
 
             # Skip if outside time window
@@ -227,10 +233,11 @@ class AnomalyDetector:
                 # Check if already added
                 if features.symbol not in [f.symbol for f in pending.followers]:
                     pending.followers.append(features)
-                    logger.debug(f"Follower added: {features.symbol} for initiator {initiator_symbol}")
+                    logger.debug(f"Follower added: {features.symbol} for initiator {initiator_symbol} (sector: {initiator_sector.name})")
 
                     # Check if sector event threshold met
-                    total_sector = len(self.config.universe.sector_symbols) - 1  # Exclude initiator
+                    # Total sector size excludes the initiator itself
+                    total_sector = len(initiator_sector.symbols) - 1
                     follower_count = len(pending.followers)
 
                     if total_sector > 0:
@@ -250,6 +257,7 @@ class AnomalyDetector:
                             status=EventStatus.SECTOR_DIFFUSION,
                             followers=[f.symbol for f in pending.followers],
                             metrics={
+                                'sector_name': initiator_sector.name,
                                 'follower_count': follower_count,
                                 'follower_share': follower_share,
                                 'follower_metrics': [
@@ -266,7 +274,7 @@ class AnomalyDetector:
                         await self.event_queue.put(('sector', sector_event))
                         await self.storage.write_event(sector_event)
 
-                        logger.info(f"Sector diffusion detected: {initiator_symbol} with {follower_count} followers")
+                        logger.info(f"Sector diffusion detected: {initiator_symbol} in sector '{initiator_sector.name}' with {follower_count} followers")
 
                         # Remove from pending
                         del self.pending_sector_events[initiator_symbol]

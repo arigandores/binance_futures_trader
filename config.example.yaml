@@ -7,11 +7,31 @@ api:
 
 universe:
   benchmark_symbol: "BTCUSDT"
-  sector_symbols:
-    - "ZECUSDT"
-    - "DASHUSDT"
-    - "XMRUSDT"
-  # Can add more symbols to sector_symbols list
+  # Multiple sectors configuration - alerts work within each sector independently
+  sectors:
+    - name: "Privacy"
+      symbols:
+        - "ZECUSDT"
+        - "DASHUSDT"
+        - "XMRUSDT"
+    - name: "DeFi"
+      symbols:
+        - "UNIUSDT"
+        - "AAVEUSDT"
+        - "SUSHIUSDT"
+        - "COMPUSDT"
+    - name: "Layer1"
+      symbols:
+        - "ETHUSDT"
+        - "SOLUSDT"
+        - "AVAXUSDT"
+        - "ADAUSDT"
+
+  # Old format still supported for backward compatibility (single sector):
+  # sector_symbols:
+  #   - "ZECUSDT"
+  #   - "DASHUSDT"
+  #   - "XMRUSDT"
 
 windows:
   bar_interval_sec: 60
