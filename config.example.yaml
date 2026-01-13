@@ -1,0 +1,56 @@
+# Binance Sector Shot Detector - Configuration
+# Copy this file to config.yaml and customize for your setup
+
+api:
+  key: ""  # Optional - if empty, advanced features (OI, taker ratio) disabled
+  secret: ""  # Required by Binance even for read-only endpoints
+
+universe:
+  benchmark_symbol: "BTCUSDT"
+  sector_symbols:
+    - "ZECUSDT"
+    - "DASHUSDT"
+    - "XMRUSDT"
+  # Can add more symbols to sector_symbols list
+
+windows:
+  bar_interval_sec: 60
+  zscore_lookback_bars: 720  # 12h on 1m bars
+  beta_lookback_bars: 240  # 4h (reduced from 24h to reduce noise)
+  beta_aggregation_minutes: 5  # Aggregate 1m bars to 5m for beta calculation
+  initiator_eval_window_bars: 15  # 15m
+  confirm_window_bars: 60  # 1h
+  sector_diffusion_window_bars: 120  # 2h
+
+thresholds:
+  excess_return_z_initiator: 3.0
+  volume_z_initiator: 3.0
+  taker_dominance_min: 0.65  # Taker buy share threshold
+  oi_delta_z_confirm: 2.0
+  liquidation_z_confirm: 2.0
+  funding_abs_threshold: 0.0010  # 0.1% absolute threshold instead of quantile
+  sector_k_min: 2  # Minimum additional coins in sector besides initiator
+  sector_share_min: 0.40  # Fraction of sector giving simplified signal
+
+alerts:
+  cooldown_minutes_per_symbol: 60
+  direction_swap_grace_minutes: 15  # Allows opposite direction sooner than cooldown
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+
+storage:
+  sqlite_path: "./data/market.db"
+  wal_mode: true  # Write-Ahead Logging for better concurrency
+  batch_write_interval_sec: 5  # Batch inserts every N seconds
+
+diffusion:
+  mode: "after_initiator"  # Only followers AFTER initiator trigger
+  # alternative: "symmetric_window" - would allow ±window around initiator
+
+runtime:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  rest_poll_sec: 60
+  ws_reconnect_backoff_sec: [1, 2, 5, 10, 30]
+  clock_skew_tolerance_sec: 2

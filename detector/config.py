@@ -1,0 +1,181 @@
+"""Configuration loading and validation."""
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+from pathlib import Path
+import yaml
+
+
+@dataclass
+class ApiConfig:
+    """API credentials configuration."""
+    key: str = ""
+    secret: str = ""
+
+    @property
+    def has_credentials(self) -> bool:
+        """Check if API credentials are provided."""
+        return bool(self.key and self.secret)
+
+
+@dataclass
+class UniverseConfig:
+    """Symbol universe configuration."""
+    benchmark_symbol: str = "BTCUSDT"
+    sector_symbols: List[str] = field(default_factory=lambda: ["ZECUSDT", "DASHUSDT", "XMRUSDT"])
+
+    @property
+    def all_symbols(self) -> List[str]:
+        """Get all symbols (benchmark + sector)."""
+        return [self.benchmark_symbol] + self.sector_symbols
+
+
+@dataclass
+class WindowsConfig:
+    """Time window configuration."""
+    bar_interval_sec: int = 60
+    zscore_lookback_bars: int = 720
+    beta_lookback_bars: int = 240
+    beta_aggregation_minutes: int = 5
+    initiator_eval_window_bars: int = 15
+    confirm_window_bars: int = 60
+    sector_diffusion_window_bars: int = 120
+
+
+@dataclass
+class ThresholdsConfig:
+    """Detection threshold configuration."""
+    excess_return_z_initiator: float = 3.0
+    volume_z_initiator: float = 3.0
+    taker_dominance_min: float = 0.65
+    oi_delta_z_confirm: float = 2.0
+    liquidation_z_confirm: float = 2.0
+    funding_abs_threshold: float = 0.0010
+    sector_k_min: int = 2
+    sector_share_min: float = 0.40
+
+
+@dataclass
+class TelegramConfig:
+    """Telegram alert configuration."""
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+
+
+@dataclass
+class AlertsConfig:
+    """Alert configuration."""
+    cooldown_minutes_per_symbol: int = 60
+    direction_swap_grace_minutes: int = 15
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+
+
+@dataclass
+class StorageConfig:
+    """Storage configuration."""
+    sqlite_path: str = "./data/market.db"
+    wal_mode: bool = True
+    batch_write_interval_sec: int = 5
+
+
+@dataclass
+class DiffusionConfig:
+    """Sector diffusion configuration."""
+    mode: str = "after_initiator"
+
+
+@dataclass
+class RuntimeConfig:
+    """Runtime configuration."""
+    log_level: str = "INFO"
+    rest_poll_sec: int = 60
+    ws_reconnect_backoff_sec: List[int] = field(default_factory=lambda: [1, 2, 5, 10, 30])
+    clock_skew_tolerance_sec: int = 2
+
+
+@dataclass
+class Config:
+    """Main configuration container."""
+    api: ApiConfig = field(default_factory=ApiConfig)
+    universe: UniverseConfig = field(default_factory=UniverseConfig)
+    windows: WindowsConfig = field(default_factory=WindowsConfig)
+    thresholds: ThresholdsConfig = field(default_factory=ThresholdsConfig)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> 'Config':
+        """Load configuration from YAML file."""
+        config_path = Path(path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+        with open(config_path, 'r') as f:
+            data = yaml.safe_load(f)
+
+        # Parse nested configs
+        config = cls()
+
+        if 'api' in data:
+            config.api = ApiConfig(**data['api'])
+
+        if 'universe' in data:
+            config.universe = UniverseConfig(**data['universe'])
+
+        if 'windows' in data:
+            config.windows = WindowsConfig(**data['windows'])
+
+        if 'thresholds' in data:
+            config.thresholds = ThresholdsConfig(**data['thresholds'])
+
+        if 'alerts' in data:
+            alerts_data = data['alerts']
+            if 'telegram' in alerts_data:
+                telegram = TelegramConfig(**alerts_data['telegram'])
+                alerts_data['telegram'] = telegram
+            config.alerts = AlertsConfig(**alerts_data)
+
+        if 'storage' in data:
+            config.storage = StorageConfig(**data['storage'])
+
+        if 'diffusion' in data:
+            config.diffusion = DiffusionConfig(**data['diffusion'])
+
+        if 'runtime' in data:
+            config.runtime = RuntimeConfig(**data['runtime'])
+
+        return config
+
+    def validate(self) -> None:
+        """Validate configuration."""
+        # Check symbols
+        if not self.universe.benchmark_symbol:
+            raise ValueError("benchmark_symbol cannot be empty")
+
+        if not self.universe.sector_symbols:
+            raise ValueError("sector_symbols cannot be empty")
+
+        # Check windows
+        if self.windows.bar_interval_sec <= 0:
+            raise ValueError("bar_interval_sec must be positive")
+
+        if self.windows.zscore_lookback_bars < 10:
+            raise ValueError("zscore_lookback_bars must be at least 10")
+
+        # Check thresholds
+        if self.thresholds.taker_dominance_min < 0.5 or self.thresholds.taker_dominance_min > 1.0:
+            raise ValueError("taker_dominance_min must be between 0.5 and 1.0")
+
+        if self.thresholds.sector_k_min < 1:
+            raise ValueError("sector_k_min must be at least 1")
+
+        if self.thresholds.sector_share_min <= 0 or self.thresholds.sector_share_min > 1.0:
+            raise ValueError("sector_share_min must be between 0 and 1.0")
+
+        # Check storage
+        storage_path = Path(self.storage.sqlite_path)
+        if not storage_path.parent.exists():
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
