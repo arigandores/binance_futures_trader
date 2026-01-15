@@ -1209,3 +1209,390 @@ def test_invalidation_no_rules_triggered(config_win_rate_max, mock_storage):
 
     # ASSERT
     assert reason is None, "Should return None when all checks pass (no invalidation)"
+
+
+# =========================================================================
+# Test Group 7: _execute_partial_profit (3 tests)
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_partial_profit_executes_at_target(mock_storage):
+    """Partial profit executes when target reached."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.use_partial_profit = True
+    config.position_management.win_rate_max_profile.partial_profit_target_atr = 1.0
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0  # ATR = 20
+
+    # Create open position
+    from detector.models import Position, PositionStatus
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=int(datetime.now().timestamp() * 1000),
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    # Current price above target (+1.0×ATR = +1.0% = 2020, current = 2025)
+    current_price = 2025.0
+    bar_ts = int(datetime.now().timestamp() * 1000)
+
+    # ACT
+    result = pm._execute_partial_profit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is True, "Partial profit should execute"
+    assert position.partial_profit_executed is True, "Flag should be set"
+    assert position.partial_profit_price == 2025.0, "Price should be recorded"
+    assert abs(position.partial_profit_pnl_percent - 1.25) < 0.01, "PnL should be ~1.25%"
+
+
+@pytest.mark.asyncio
+async def test_partial_profit_only_executes_once(mock_storage):
+    """Partial profit only executes once (flag prevents re-execution)."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.use_partial_profit = True
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0
+
+    # Create position with partial_profit_executed=True (already executed)
+    from detector.models import Position, PositionStatus
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=int(datetime.now().timestamp() * 1000),
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65,
+        partial_profit_executed=True  # Already executed
+    )
+
+    # Current price above target (should trigger if not already executed)
+    current_price = 2025.0
+    bar_ts = int(datetime.now().timestamp() * 1000)
+
+    # ACT
+    result = pm._execute_partial_profit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is False, "Should not execute again (already executed)"
+
+
+@pytest.mark.asyncio
+async def test_partial_profit_moves_sl_to_breakeven(mock_storage):
+    """Partial profit moves SL to breakeven after execution."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.use_partial_profit = True
+    config.position_management.win_rate_max_profile.partial_profit_move_sl_breakeven = True
+    config.position_management.win_rate_max_profile.partial_profit_target_atr = 1.0
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0
+
+    # Create open position
+    from detector.models import Position, PositionStatus
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=int(datetime.now().timestamp() * 1000),
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    # Current price at target
+    current_price = 2025.0
+    bar_ts = int(datetime.now().timestamp() * 1000)
+
+    # ACT
+    result = pm._execute_partial_profit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is True, "Partial profit should execute"
+    assert position.metrics.get('breakeven_stop_active') is True, "Breakeven stop should be active"
+    assert position.metrics.get('breakeven_stop_price') == 2000.0, "Breakeven stop should be at entry price"
+
+
+# =========================================================================
+# Test Group 8: _check_time_exit (2 tests)
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_time_exit_triggers_after_duration(mock_storage):
+    """Time exit triggers if position not profitable enough after duration."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.time_exit_enabled = True
+    config.position_management.win_rate_max_profile.time_exit_minutes = 25
+    config.position_management.win_rate_max_profile.time_exit_min_pnl_atr_mult = 0.5
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0
+
+    # Create position opened 30 minutes ago
+    from detector.models import Position, PositionStatus
+    now_ts = int(datetime.now().timestamp() * 1000)
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=now_ts - (30 * 60 * 1000),  # 30 minutes ago
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    # Current PnL: +0.3% (< min +0.5×ATR = +1.0%)
+    current_price = 2006.0  # +0.3%
+    bar_ts = now_ts
+
+    # ACT
+    result = pm._check_time_exit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is True, "Time exit should trigger (held 30m >= 25m, PnL 0.3% < min 1.0%)"
+
+
+@pytest.mark.asyncio
+async def test_time_exit_allows_profitable_position(mock_storage):
+    """Time exit does NOT trigger if position profitable enough."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.time_exit_enabled = True
+    config.position_management.win_rate_max_profile.time_exit_minutes = 25
+    config.position_management.win_rate_max_profile.time_exit_min_pnl_atr_mult = 0.5
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0
+
+    # Create position opened 30 minutes ago
+    from detector.models import Position, PositionStatus
+    now_ts = int(datetime.now().timestamp() * 1000)
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=now_ts - (30 * 60 * 1000),  # 30 minutes ago
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    # Current PnL: +1.5% (> min +0.5×ATR = +1.0%)
+    current_price = 2030.0  # +1.5%
+    bar_ts = now_ts
+
+    # ACT
+    result = pm._check_time_exit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is False, "Time exit should NOT trigger (PnL 1.5% >= min 1.0%)"
+
+
+# =========================================================================
+# Additional Edge Case Tests (Bonus)
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_partial_profit_skips_for_default_profile(mock_storage):
+    """Partial profit skipped for DEFAULT profile."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="DEFAULT"
+    )
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0
+
+    # Create position at target
+    from detector.models import Position, PositionStatus
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=int(datetime.now().timestamp() * 1000),
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    current_price = 2025.0  # At target
+    bar_ts = int(datetime.now().timestamp() * 1000)
+
+    # ACT
+    result = pm._execute_partial_profit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is False, "Should skip for DEFAULT profile"
+
+
+@pytest.mark.asyncio
+async def test_time_exit_skips_before_duration(mock_storage):
+    """Time exit skips before duration threshold."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.time_exit_enabled = True
+    config.position_management.win_rate_max_profile.time_exit_minutes = 25
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: 20.0
+
+    # Create position opened 10 minutes ago (< 25min threshold)
+    from detector.models import Position, PositionStatus
+    now_ts = int(datetime.now().timestamp() * 1000)
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=now_ts - (10 * 60 * 1000),  # 10 minutes ago
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    current_price = 2006.0  # +0.3% (low PnL, but too early)
+    bar_ts = now_ts
+
+    # ACT
+    result = pm._check_time_exit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is False, "Should not trigger before duration threshold (10m < 25m)"
+
+
+@pytest.mark.asyncio
+async def test_time_exit_fallback_without_atr(mock_storage):
+    """Time exit fallback triggers without ATR after 2x duration."""
+    # ARRANGE
+    config = Config()
+    config.position_management = PositionManagementConfig(
+        enabled=True,
+        profile="WIN_RATE_MAX"
+    )
+    config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    config.position_management.win_rate_max_profile.time_exit_enabled = True
+    config.position_management.win_rate_max_profile.time_exit_minutes = 25
+
+    pm = create_position_manager(config, mock_storage)
+
+    # Mock FeaturesExtended with NO ATR
+    from unittest.mock import MagicMock
+    pm.extended_features = MagicMock()
+    pm.extended_features.get_atr = lambda symbol: None  # No ATR available
+
+    # Create position opened 51 minutes ago (> 2× 25min)
+    from detector.models import Position, PositionStatus
+    now_ts = int(datetime.now().timestamp() * 1000)
+    position = Position(
+        position_id="ETHUSDT_test",
+        event_id="test_event",
+        symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=PositionStatus.OPEN,
+        open_price=2000.0,
+        open_ts=now_ts - (51 * 60 * 1000),  # 51 minutes ago (> 2×25min)
+        entry_z_er=3.5,
+        entry_z_vol=3.2,
+        entry_taker_share=0.65
+    )
+
+    # PnL <= 0 (fallback condition)
+    current_price = 1995.0  # -0.25%
+    bar_ts = now_ts
+
+    # ACT
+    result = pm._check_time_exit(position, current_price, bar_ts)
+
+    # ASSERT
+    assert result is True, "Fallback should trigger (51m > 2×25m, PnL <= 0, no ATR)"

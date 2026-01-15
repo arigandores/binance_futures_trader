@@ -791,7 +791,10 @@ class PositionManager:
         ]
 
         for position in positions_to_check:
-            # Update trailing stop first
+            # WIN_RATE_MAX: Execute partial profit if target reached (before exit checks)
+            self._execute_partial_profit(position, bar.close, bar.ts_minute)
+
+            # Update trailing stop
             await self._update_trailing_stop(position, bar.close, features)
 
             # Then check exit conditions
@@ -1371,6 +1374,180 @@ class PositionManager:
         )
         return None
 
+    # =========================================================================
+    # WIN_RATE_MAX Profile: Exit Enhancements (Step 4.4)
+    # =========================================================================
+
+    def _calculate_pnl_percent(self, position: Position, current_price: float) -> float:
+        """
+        Calculate position PnL as percentage.
+
+        Args:
+            position: Position to calculate PnL for
+            current_price: Current market price
+
+        Returns:
+            PnL as percentage (positive = profit, negative = loss)
+        """
+        if position.direction == Direction.UP:
+            return ((current_price - position.open_price) / position.open_price) * 100
+        else:  # Direction.DOWN
+            return ((position.open_price - current_price) / position.open_price) * 100
+
+    def _execute_partial_profit(
+        self,
+        position: Position,
+        current_price: float,
+        bar_ts: int
+    ) -> bool:
+        """
+        Execute partial profit taking if target reached (WIN_RATE_MAX only).
+
+        Closes 50% of position at +1.0xATR, moves stop loss to breakeven.
+        Can only execute once per position.
+
+        Args:
+            position: Position to check
+            current_price: Current market price
+            bar_ts: Current bar timestamp (ms)
+
+        Returns:
+            True if partial profit executed, False otherwise
+        """
+        # Skip for DEFAULT profile
+        if self.config.position_management.profile != "WIN_RATE_MAX":
+            return False
+
+        profile = self.config.position_management.win_rate_max_profile
+
+        # Check if enabled
+        if not profile.use_partial_profit:
+            logger.debug(f"{position.symbol}: Partial profit SKIPPED (disabled)")
+            return False
+
+        # Check if already executed (one-time only)
+        if position.partial_profit_executed:
+            logger.debug(f"{position.symbol}: Partial profit SKIPPED (already executed)")
+            return False
+
+        # Calculate partial profit target (+1.0xATR)
+        atr = self.extended_features.get_atr(position.symbol)
+        if atr is None:
+            logger.debug(f"{position.symbol}: Partial profit SKIPPED (ATR unavailable)")
+            return False  # Can't calculate without ATR
+
+        # Calculate target distance as percentage
+        target_distance_pct = (atr / position.open_price) * profile.partial_profit_target_atr * 100
+
+        # Check if target reached
+        current_pnl_pct = self._calculate_pnl_percent(position, current_price)
+
+        if current_pnl_pct >= target_distance_pct:
+            # Execute partial profit
+            position.partial_profit_executed = True
+            position.partial_profit_price = current_price
+            position.partial_profit_pnl_percent = current_pnl_pct
+            position.partial_profit_ts = bar_ts
+
+            logger.info(
+                f"{position.symbol}: Partial profit EXECUTED "
+                f"(50% at +{current_pnl_pct:.2f}%, target was +{target_distance_pct:.2f}%)"
+            )
+
+            # Move stop loss to breakeven if configured
+            if profile.partial_profit_move_sl_breakeven:
+                # Store breakeven stop in position metrics for exit logic to use
+                position.metrics['breakeven_stop_active'] = True
+                position.metrics['breakeven_stop_price'] = position.open_price
+                logger.info(
+                    f"{position.symbol}: Stop loss moved to breakeven ({position.open_price:.6f})"
+                )
+
+            return True
+
+        logger.debug(
+            f"{position.symbol}: Partial profit NOT triggered "
+            f"(PnL: {current_pnl_pct:.2f}% < target: {target_distance_pct:.2f}%)"
+        )
+        return False
+
+    def _check_time_exit(
+        self,
+        position: Position,
+        current_price: float,
+        bar_ts: int
+    ) -> bool:
+        """
+        Check if position should exit due to time limit (WIN_RATE_MAX only).
+
+        Exits if position not at minimum profit target after time_exit_minutes.
+        Prevents holding stagnant positions that eat into win rate.
+
+        Args:
+            position: Position to check
+            current_price: Current market price
+            bar_ts: Current bar timestamp (ms)
+
+        Returns:
+            True if should exit due to time, False otherwise
+        """
+        # Skip for DEFAULT profile
+        if self.config.position_management.profile != "WIN_RATE_MAX":
+            return False
+
+        profile = self.config.position_management.win_rate_max_profile
+
+        # Check if enabled
+        if not profile.time_exit_enabled:
+            logger.debug(f"{position.symbol}: Time exit SKIPPED (disabled)")
+            return False
+
+        # Calculate position duration (minutes)
+        duration_ms = bar_ts - position.open_ts
+        duration_minutes = duration_ms / (1000 * 60)
+
+        if duration_minutes < profile.time_exit_minutes:
+            logger.debug(
+                f"{position.symbol}: Time exit NOT triggered "
+                f"(held {duration_minutes:.1f}m < {profile.time_exit_minutes}m)"
+            )
+            return False  # Not enough time elapsed
+
+        # Check if position is profitable enough
+        atr = self.extended_features.get_atr(position.symbol)
+        current_pnl_pct = self._calculate_pnl_percent(position, current_price)
+
+        if atr is None:
+            # Can't calculate threshold without ATR, use fallback logic
+            # If held > 2x time_exit_minutes and not positive, exit
+            if duration_minutes > profile.time_exit_minutes * 2:
+                if current_pnl_pct <= 0:
+                    logger.info(
+                        f"{position.symbol}: Time exit TRIGGERED (fallback) "
+                        f"(held {duration_minutes:.1f}m, PnL {current_pnl_pct:.2f}% <= 0, no ATR)"
+                    )
+                    return True
+            logger.debug(
+                f"{position.symbol}: Time exit SKIPPED (no ATR, PnL: {current_pnl_pct:.2f}%)"
+            )
+            return False
+
+        # Calculate minimum profit requirement (+0.5xATR by default)
+        min_profit_pct = (atr / position.open_price) * profile.time_exit_min_pnl_atr_mult * 100
+
+        if current_pnl_pct < min_profit_pct:
+            logger.info(
+                f"{position.symbol}: Time exit TRIGGERED "
+                f"(held {duration_minutes:.1f}m, PnL {current_pnl_pct:.2f}% < min {min_profit_pct:.2f}%)"
+            )
+            return True
+
+        logger.debug(
+            f"{position.symbol}: Time exit NOT triggered "
+            f"(PnL {current_pnl_pct:.2f}% >= min {min_profit_pct:.2f}%)"
+        )
+        return False
+
     async def _update_trailing_stop(
         self,
         position: Position,
@@ -1434,11 +1611,13 @@ class PositionManager:
 
         Exit priority (revised):
         1. Trailing Stop (if activated and hit)
-        2. Fixed Stop Loss (protect capital)
-        3. Take Profit (lock in gains)
-        4. Z-Score Reversal (signal weakened - now more lenient at 0.5)
-        5. Order Flow Reversal
-        6. Time Exit (now 120 minutes)
+        2. Breakeven Stop (WIN_RATE_MAX: after partial profit, SL at entry)
+        3. Fixed Stop Loss (protect capital)
+        4. Take Profit (lock in gains)
+        5. Z-Score Reversal (signal weakened - now more lenient at 0.5)
+        6. Order Flow Reversal
+        7. WIN_RATE_MAX Time Exit (stricter: 25m, must be +0.5xATR)
+        8. Default Time Exit (120 minutes)
         """
         cfg = self.config.position_management
         direction_multiplier = 1 if position.direction == Direction.UP else -1
@@ -1456,7 +1635,24 @@ class PositionManager:
                 elif position.direction == Direction.DOWN and current_price >= trailing_stop_price:
                     return ExitReason.TRAILING_STOP
 
-        # 2. Fixed Stop Loss check
+        # 2. Breakeven Stop check (WIN_RATE_MAX: after partial profit executed)
+        if position.metrics.get('breakeven_stop_active'):
+            breakeven_price = position.metrics.get('breakeven_stop_price')
+            if breakeven_price is not None:
+                if position.direction == Direction.UP and current_price <= breakeven_price:
+                    logger.info(
+                        f"{position.symbol}: Breakeven stop triggered "
+                        f"(price {current_price:.6f} <= breakeven {breakeven_price:.6f})"
+                    )
+                    return ExitReason.STOP_LOSS  # Exit at breakeven (0% loss)
+                elif position.direction == Direction.DOWN and current_price >= breakeven_price:
+                    logger.info(
+                        f"{position.symbol}: Breakeven stop triggered "
+                        f"(price {current_price:.6f} >= breakeven {breakeven_price:.6f})"
+                    )
+                    return ExitReason.STOP_LOSS  # Exit at breakeven (0% loss)
+
+        # 3. Fixed Stop Loss check
         stop_loss_pct = position.metrics.get('dynamic_stop_loss', cfg.stop_loss_percent)
 
         if cfg.use_atr_stops and 'dynamic_stop_loss' not in position.metrics:
@@ -1469,23 +1665,23 @@ class PositionManager:
         if pnl_pct <= -stop_loss_pct:
             return ExitReason.STOP_LOSS
 
-        # 3. Take Profit check
+        # 4. Take Profit check
         take_profit_pct = position.metrics.get('dynamic_take_profit', cfg.take_profit_percent)
 
         if pnl_pct >= take_profit_pct:
             return ExitReason.TAKE_PROFIT
 
-        # 4. Z-Score Reversal check (RELAXED from 1.0 to 0.5)
+        # 5. Z-Score Reversal check (RELAXED from 1.0 to 0.5)
         if abs(features.z_er_15m) < cfg.z_score_exit_threshold:
             return ExitReason.Z_SCORE_REVERSAL
 
-        # 5. Opposite Signal check (strong signal in opposite direction)
+        # 6. Opposite Signal check (strong signal in opposite direction)
         if cfg.exit_on_opposite_signal:
             opposite_direction = Direction.DOWN if position.direction == Direction.UP else Direction.UP
             if features.direction == opposite_direction and abs(features.z_er_15m) >= cfg.opposite_signal_threshold:
                 return ExitReason.OPPOSITE_SIGNAL
 
-        # 6. Order Flow Reversal check
+        # 7. Order Flow Reversal check
         if cfg.exit_on_order_flow_reversal:
             extended = self.extended_features.update(bar)
             taker_delta = extended.get('taker_flow_delta')
@@ -1499,7 +1695,11 @@ class PositionManager:
                 elif position.direction == Direction.DOWN and taker_delta > threshold:
                     return ExitReason.ORDER_FLOW_REVERSAL
 
-        # 7. Time Exit check
+        # 8. WIN_RATE_MAX Time Exit (stricter: must be profitable after N minutes)
+        if self._check_time_exit(position, current_price, bar.ts_minute):
+            return ExitReason.TIME_EXIT
+
+        # 9. Default Time Exit check (max hold time)
         if cfg.max_hold_minutes > 0:
             duration_minutes = (bar.ts_minute - position.open_ts) // (60 * 1000)
             if duration_minutes >= cfg.max_hold_minutes:

@@ -103,6 +103,20 @@ class ExtendedFeatureCalculator:
 
         return current_share - previous_share
 
+    def get_atr(self, symbol: str) -> Optional[float]:
+        """
+        Get current ATR (Average True Range) for a symbol.
+
+        This is a public wrapper for _calculate_atr().
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            ATR value or None if insufficient data
+        """
+        return self._calculate_atr(symbol)
+
     def get_atr_multiple(self, symbol: str, price: float, multiplier: float = 1.0) -> Optional[float]:
         """
         Get ATR as a multiple of current price (for percentage-based stops).
