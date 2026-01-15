@@ -1185,6 +1185,192 @@ class PositionManager:
 
         return re_expansion_confirmed
 
+    # =========================================================================
+    # WIN_RATE_MAX Profile: Enhanced Invalidation (Step 4.3)
+    # =========================================================================
+
+    def _check_invalidation_rules(
+        self,
+        pending: PendingSignal,
+        bar: Bar,
+        features: Features
+    ) -> Optional[str]:
+        """
+        Check if pending signal should be invalidated (WIN_RATE_MAX profile only).
+
+        Checks invalidation rules in STRICT priority order (first match wins):
+        1. Direction flip (highest priority) - z_ER sign changed
+        2. Momentum died - abs(z_ER) < invalidate_z_er_min (1.8)
+        3. Flow died - dominance < threshold for N consecutive bars
+        4. Structure broken - pullback exceeded max (latched)
+        5. TTL expiry (lowest priority) - watch window exceeded
+
+        Latching behavior:
+        - pullback_exceeded_max: Once set, stays set (latched)
+        - flow_death_bar_count: Counter that accumulates, resets on recovery
+        - All other checks are live (current bar only)
+
+        Args:
+            pending: Pending signal to check
+            bar: Current 1-minute bar
+            features: Current features for the symbol
+
+        Returns:
+            Invalidation reason (str) if should invalidate, None otherwise
+        """
+        # Skip for DEFAULT profile (use existing basic invalidation only)
+        if self.config.position_management.profile != "WIN_RATE_MAX":
+            logger.debug(
+                f"{pending.symbol}: Enhanced invalidation SKIPPED (profile != WIN_RATE_MAX)"
+            )
+            return None
+
+        profile = self.config.position_management.win_rate_max_profile
+        symbol = pending.symbol
+        direction = pending.direction
+
+        # =====================================================================
+        # PRIORITY 1: Direction flip (HIGHEST PRIORITY)
+        # If z_ER sign changed, signal is invalid - momentum reversed
+        # =====================================================================
+        z_er = features.z_er_15m if features.z_er_15m is not None else 0.0
+
+        if direction == Direction.UP and z_er < 0:
+            logger.debug(
+                f"{symbol}: Invalidation TRIGGERED (priority 1) - direction flip "
+                f"(was UP, z_ER now {z_er:.2f} < 0)"
+            )
+            return "direction_flip"
+        elif direction == Direction.DOWN and z_er > 0:
+            logger.debug(
+                f"{symbol}: Invalidation TRIGGERED (priority 1) - direction flip "
+                f"(was DOWN, z_ER now {z_er:.2f} > 0)"
+            )
+            return "direction_flip"
+
+        logger.debug(
+            f"{symbol}: Priority 1 (direction flip) PASSED "
+            f"(direction={direction.value}, z_ER={z_er:.2f})"
+        )
+
+        # =====================================================================
+        # PRIORITY 2: Momentum died
+        # If abs(z_ER) < invalidate_z_er_min, momentum too weak to continue
+        # =====================================================================
+        abs_z_er = abs(z_er)
+
+        if abs_z_er < profile.invalidate_z_er_min:
+            logger.debug(
+                f"{symbol}: Invalidation TRIGGERED (priority 2) - momentum died "
+                f"(|z_ER|={abs_z_er:.2f} < {profile.invalidate_z_er_min})"
+            )
+            return "momentum_died"
+
+        logger.debug(
+            f"{symbol}: Priority 2 (momentum died) PASSED "
+            f"(|z_ER|={abs_z_er:.2f} >= {profile.invalidate_z_er_min})"
+        )
+
+        # =====================================================================
+        # PRIORITY 3: Flow died
+        # If taker dominance < threshold for N consecutive bars, flow exhausted
+        # Uses counter that accumulates but resets on recovery
+        # =====================================================================
+        taker_share = bar.taker_buy_share()
+
+        if taker_share is not None:
+            # Check dominance in signal direction
+            if direction == Direction.UP:
+                # For LONG: need buy dominance >= threshold
+                dominance_ok = taker_share >= profile.invalidate_taker_dominance_min
+                current_dominance = taker_share
+                dominance_label = "buy"
+            else:  # Direction.DOWN
+                # For SHORT: need sell dominance >= threshold (1 - buy_share)
+                sell_dominance = 1.0 - taker_share
+                dominance_ok = sell_dominance >= profile.invalidate_taker_dominance_min
+                current_dominance = sell_dominance
+                dominance_label = "sell"
+
+            # Update flow death counter
+            if not dominance_ok:
+                pending.flow_death_bar_count += 1
+                logger.debug(
+                    f"{symbol}: Low {dominance_label} dominance bar "
+                    f"{pending.flow_death_bar_count}/{profile.invalidate_taker_dominance_bars} "
+                    f"(current: {current_dominance:.3f} < {profile.invalidate_taker_dominance_min})"
+                )
+            else:
+                # Reset counter if dominance recovers
+                if pending.flow_death_bar_count > 0:
+                    logger.debug(
+                        f"{symbol}: {dominance_label.capitalize()} dominance recovered "
+                        f"({current_dominance:.3f} >= {profile.invalidate_taker_dominance_min}), "
+                        f"resetting counter from {pending.flow_death_bar_count} to 0"
+                    )
+                pending.flow_death_bar_count = 0
+
+            # Invalidate if threshold reached
+            if pending.flow_death_bar_count >= profile.invalidate_taker_dominance_bars:
+                logger.debug(
+                    f"{symbol}: Invalidation TRIGGERED (priority 3) - flow died "
+                    f"({pending.flow_death_bar_count} consecutive bars with "
+                    f"{dominance_label} dominance < {profile.invalidate_taker_dominance_min})"
+                )
+                return "flow_died"
+
+            logger.debug(
+                f"{symbol}: Priority 3 (flow died) PASSED "
+                f"(flow_death_bar_count={pending.flow_death_bar_count} "
+                f"< {profile.invalidate_taker_dominance_bars})"
+            )
+        else:
+            # No taker data available - log but don't block (fail-open for this check)
+            logger.debug(
+                f"{symbol}: Priority 3 (flow died) SKIPPED - no taker data available"
+            )
+
+        # =====================================================================
+        # PRIORITY 4: Structure broken
+        # If pullback_exceeded_max was set (LATCHED), structure is broken
+        # This flag is set elsewhere when pullback > max_pullback_pct/atr
+        # =====================================================================
+        if pending.pullback_exceeded_max:
+            logger.debug(
+                f"{symbol}: Invalidation TRIGGERED (priority 4) - structure broken "
+                f"(pullback exceeded max, flag was latched)"
+            )
+            return "structure_broken"
+
+        logger.debug(
+            f"{symbol}: Priority 4 (structure broken) PASSED "
+            f"(pullback_exceeded_max={pending.pullback_exceeded_max})"
+        )
+
+        # =====================================================================
+        # PRIORITY 5: TTL expiry (LOWEST PRIORITY)
+        # Already checked in _check_pending_signals, but include for completeness
+        # =====================================================================
+        if pending.is_expired(bar.ts_minute):
+            logger.debug(
+                f"{symbol}: Invalidation TRIGGERED (priority 5) - TTL expired "
+                f"(current_ts={bar.ts_minute} >= expires_ts={pending.expires_ts})"
+            )
+            return "ttl_expired"
+
+        logger.debug(
+            f"{symbol}: Priority 5 (TTL expiry) PASSED "
+            f"(current_ts={bar.ts_minute} < expires_ts={pending.expires_ts})"
+        )
+
+        # =====================================================================
+        # All checks passed - no invalidation
+        # =====================================================================
+        logger.debug(
+            f"{symbol}: All invalidation rules PASSED (no invalidation)"
+        )
+        return None
+
     async def _update_trailing_stop(
         self,
         position: Position,

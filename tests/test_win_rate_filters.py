@@ -96,10 +96,16 @@ def create_bar(
     symbol: str,
     close: float = 50000.0,
     notional: float = 100000.0,
-    trades: int = 100
+    trades: int = 100,
+    taker_buy_share: float = 0.6
 ) -> Bar:
     """Helper to create Bar object."""
     ts_minute = int(datetime.now().timestamp() * 1000)
+    # Calculate taker_buy and taker_sell from share
+    total_volume = 100.0
+    taker_buy = total_volume * taker_buy_share
+    taker_sell = total_volume * (1.0 - taker_buy_share)
+
     return Bar(
         symbol=symbol,
         ts_minute=ts_minute,
@@ -107,11 +113,11 @@ def create_bar(
         high=close + 10,
         low=close - 20,
         close=close,
-        volume=100.0,
+        volume=total_volume,
         notional=notional,
         trades=trades,
-        taker_buy=60.0,
-        taker_sell=40.0
+        taker_buy=taker_buy,
+        taker_sell=taker_sell
     )
 
 
@@ -811,3 +817,395 @@ def test_re_expansion_skips_for_default_profile(config_default, mock_storage):
 
     # ASSERT
     assert result is True, "Should skip check for DEFAULT profile (always return True)"
+
+
+# =========================================================================
+# Test Group 6: _check_invalidation_rules (9 tests)
+# =========================================================================
+
+def test_invalidation_priority_1_direction_flip(config_win_rate_max, mock_storage):
+    """Direction flip has highest priority (priority 1)."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal (Direction.UP)
+    event = Event(
+        event_id="test_event_9",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+
+    # Create features with direction flip (z_ER now negative)
+    features = create_features(symbol="ETHUSDT", z_er=-2.0)  # Flipped to DOWN
+    bar = create_bar(symbol="ETHUSDT")
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason == "direction_flip", "Direction flip should be highest priority"
+
+
+def test_invalidation_priority_2_momentum_died(config_win_rate_max, mock_storage):
+    """Momentum died check works (priority 2)."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal (Direction.UP)
+    event = Event(
+        event_id="test_event_10",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+
+    # Create features with weak momentum but correct direction
+    features = create_features(symbol="ETHUSDT", z_er=1.5)  # 1.5 < 1.8 (min threshold)
+    bar = create_bar(symbol="ETHUSDT")
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason == "momentum_died", "Momentum died should be priority 2"
+
+
+def test_invalidation_priority_3_flow_died_after_two_bars(config_win_rate_max, mock_storage):
+    """Flow died check works after 2 consecutive low-dominance bars (priority 3)."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal (Direction.UP)
+    event = Event(
+        event_id="test_event_11",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+
+    # Set flow_death_bar_count to 1 (already 1 bar)
+    pending.flow_death_bar_count = 1
+
+    # Create features with good momentum
+    features = create_features(symbol="ETHUSDT", z_er=2.5)  # Above 1.8 threshold
+
+    # Create bar with low buy dominance (0.45 < 0.52)
+    bar = create_bar(symbol="ETHUSDT")
+    bar.taker_buy = 45.0
+    bar.taker_sell = 55.0
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason == "flow_died", "Flow died should be priority 3 after 2 consecutive bars"
+
+
+def test_invalidation_priority_4_structure_broken(config_win_rate_max, mock_storage):
+    """Structure broken check works (priority 4) - latched flag."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal with pullback_exceeded_max=True (latched)
+    event = Event(
+        event_id="test_event_12",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+    pending.pullback_exceeded_max = True  # Latched flag
+
+    # Create features with good momentum and flow
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+    bar = create_bar(symbol="ETHUSDT")
+    bar.taker_buy = 60.0
+    bar.taker_sell = 40.0
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason == "structure_broken", "Structure broken should be priority 4"
+
+
+def test_invalidation_priority_5_ttl_expired(config_win_rate_max, mock_storage):
+    """TTL expiry check works (priority 5 - lowest)."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal with expired TTL
+    event = Event(
+        event_id="test_event_13",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    current_ts = int(datetime.now().timestamp() * 1000)
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=current_ts - 700000,  # Created 700 seconds ago
+        expires_ts=current_ts - 100000,  # Expired 100 seconds ago
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+
+    # Create features and bar with all other checks passing
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+    bar = create_bar(symbol="ETHUSDT")
+    bar.ts_minute = current_ts  # Current time
+    bar.taker_buy = 60.0
+    bar.taker_sell = 40.0
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason == "ttl_expired", "TTL expiry should be priority 5 (lowest)"
+
+
+def test_invalidation_priority_order_first_match_wins(config_win_rate_max, mock_storage):
+    """Verify FIRST match wins (higher priority blocks lower) - CRITICAL TEST."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal with multiple invalidation reasons
+    event = Event(
+        event_id="test_event_14",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    current_ts = int(datetime.now().timestamp() * 1000)
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=current_ts - 700000,
+        expires_ts=current_ts - 100000,  # EXPIRED (priority 5)
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+    pending.flow_death_bar_count = 2  # FLOW DIED (priority 3)
+    pending.pullback_exceeded_max = True  # STRUCTURE BROKEN (priority 4)
+
+    # Create features with direction flip (HIGHEST PRIORITY)
+    features = create_features(symbol="ETHUSDT", z_er=-2.0)  # DIRECTION FLIP (priority 1)
+    bar = create_bar(symbol="ETHUSDT")
+    bar.ts_minute = current_ts
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason == "direction_flip", "Direction flip (priority 1) should win despite multiple other issues"
+
+
+def test_invalidation_flow_death_counter_resets_on_recovery(config_win_rate_max, mock_storage):
+    """Flow death counter resets when dominance recovers."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal
+    event = Event(
+        event_id="test_event_15",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # FIRST CALL: Low dominance (counter should increment to 1)
+    bar1 = create_bar(symbol="ETHUSDT")
+    bar1.taker_buy = 45.0  # 0.45 < 0.52 (low dominance)
+    bar1.taker_sell = 55.0
+
+    reason1 = pm._check_invalidation_rules(pending, bar1, features)
+
+    # ASSERT first call
+    assert reason1 is None, "Should not invalidate after only 1 bar"
+    assert pending.flow_death_bar_count == 1, "Counter should increment to 1"
+
+    # SECOND CALL: High dominance (counter should reset to 0)
+    bar2 = create_bar(symbol="ETHUSDT")
+    bar2.taker_buy = 60.0  # 0.60 >= 0.52 (dominance recovered)
+    bar2.taker_sell = 40.0
+
+    reason2 = pm._check_invalidation_rules(pending, bar2, features)
+
+    # ASSERT second call
+    assert reason2 is None, "Should not invalidate on recovery"
+    assert pending.flow_death_bar_count == 0, "Counter should reset to 0 on recovery"
+
+
+def test_invalidation_skips_for_default_profile(config_default, mock_storage):
+    """Enhanced invalidation skipped for DEFAULT profile."""
+    # ARRANGE
+    pm = create_position_manager(config_default, mock_storage)
+
+    # Create pending signal with direction flip (would normally invalidate)
+    event = Event(
+        event_id="test_event_16",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+
+    # Create features with direction flip
+    features = create_features(symbol="ETHUSDT", z_er=-2.0)  # Flipped
+    bar = create_bar(symbol="ETHUSDT")
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason is None, "Should skip enhanced invalidation for DEFAULT profile"
+
+
+def test_invalidation_no_rules_triggered(config_win_rate_max, mock_storage):
+    """Returns None when all checks pass (no invalidation)."""
+    # ARRANGE
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_z_er_min = 1.8
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_min = 0.52
+    config_win_rate_max.position_management.win_rate_max_profile.invalidate_taker_dominance_bars = 2
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal with all valid conditions
+    event = Event(
+        event_id="test_event_17",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    current_ts = int(datetime.now().timestamp() * 1000)
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=current_ts,
+        expires_ts=current_ts + 600000,  # NOT expired (600 seconds in future)
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0
+    )
+    pending.flow_death_bar_count = 0  # No flow issues
+    pending.pullback_exceeded_max = False  # No structure issues
+
+    # Create features with good momentum and correct direction
+    features = create_features(symbol="ETHUSDT", z_er=2.5)  # > 1.8 AND positive (same direction)
+
+    # Create bar with good dominance
+    bar = create_bar(symbol="ETHUSDT")
+    bar.ts_minute = current_ts
+    bar.taker_buy = 60.0  # 0.60 >= 0.52 (good dominance)
+    bar.taker_sell = 40.0
+
+    # ACT
+    reason = pm._check_invalidation_rules(pending, bar, features)
+
+    # ASSERT
+    assert reason is None, "Should return None when all checks pass (no invalidation)"
