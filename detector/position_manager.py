@@ -306,6 +306,28 @@ class PositionManager:
             logger.warning(f"{symbol}: No bar data, cannot create pending signal")
             return
 
+        # =====================================================================
+        # WIN_RATE_MAX: Market regime filters (Step 4.1 integration)
+        # Run BEFORE creating pending signal to filter out bad market conditions
+        # =====================================================================
+        if self.config.position_management.profile == "WIN_RATE_MAX":
+            # Check BTC anomaly filter
+            if not self._check_btc_anomaly_filter(symbol):
+                logger.info(f"{symbol}: Pending signal blocked by BTC anomaly filter")
+                return
+
+            # Check symbol quality filter
+            if not self._check_symbol_quality_filter(symbol):
+                logger.info(f"{symbol}: Pending signal blocked by symbol quality filter")
+                return
+
+            # Check beta quality filter
+            if not self._check_beta_quality_filter(symbol):
+                logger.info(f"{symbol}: Pending signal blocked by beta quality filter")
+                return
+
+            logger.debug(f"{symbol}: All WIN_RATE_MAX market regime filters PASSED")
+
         # Create pending signal with TTL (max watch window)
         # Must-Fix #1: Use bar time scale, not event.ts or wall clock
         max_wait_ms = cfg.entry_trigger_max_wait_minutes * 60 * 1000
@@ -431,6 +453,10 @@ class PositionManager:
         - #5: Features freshness check
         - #7: Stability + dominance
 
+        WIN_RATE_MAX Profile additions:
+        - Enhanced invalidation rules (checked FIRST, priority-ordered)
+        - Re-expansion check (checked LAST, after all other triggers)
+
         Updates pending.z_cooldown_met, pending.pullback_met, pending.stability_met.
         Returns True if ALL triggers met.
         """
@@ -441,6 +467,21 @@ class PositionManager:
         # If triggers disabled globally, always allow (shouldn't happen in pending queue)
         if not cfg.use_entry_triggers:
             return True
+
+        # =====================================================================
+        # WIN_RATE_MAX: Enhanced invalidation rules (Step 4.3 integration)
+        # Check FIRST before any other trigger evaluation (highest priority)
+        # =====================================================================
+        if current_features is not None:
+            invalidation_reason = self._check_invalidation_rules(pending, current_bar, current_features)
+            if invalidation_reason:
+                logger.info(
+                    f"{symbol}: Pending signal invalidated - {invalidation_reason} "
+                    f"(WIN_RATE_MAX enhanced invalidation)"
+                )
+                pending.invalidated = True
+                pending.invalidation_reason = invalidation_reason
+                return False
 
         # Need features for z-score check
         if current_features is None:
@@ -560,18 +601,33 @@ class PositionManager:
                             f"AND dominant (sell: {1-current_taker_share:.2f}) ✓"
                         )
 
-        # Check if all triggers met
+        # Check if all DEFAULT triggers met
         all_met = pending.all_triggers_met()
 
-        if all_met:
-            logger.info(
-                f"{symbol}: ALL entry triggers met! "
-                f"(z_cool: {pending.z_cooldown_met}, "
-                f"pullback: {pending.pullback_met}, "
-                f"stability+dominance: {pending.stability_met})"
-            )
+        if not all_met:
+            # Default triggers not met yet, no need to check re-expansion
+            return False
 
-        return all_met
+        # =====================================================================
+        # WIN_RATE_MAX: Re-expansion check (Step 4.2 integration)
+        # Check AFTER all default triggers are met, BEFORE opening position
+        # This is the LAST gate before entry - ensures momentum is resuming
+        # =====================================================================
+        re_expansion_ok = self._check_re_expansion(pending, current_bar, current_features)
+        if not re_expansion_ok:
+            logger.debug(
+                f"{symbol}: Re-expansion not confirmed (skipping entry this bar) - "
+                f"DEFAULT triggers passed, waiting for momentum resumption"
+            )
+            return False  # Wait for re-expansion
+
+        logger.info(
+            f"{symbol}: ALL entry triggers met! "
+            f"(z_cool: {pending.z_cooldown_met}, pullback: {pending.pullback_met}, "
+            f"stability+dominance: {pending.stability_met}, re_expansion: {re_expansion_ok})"
+        )
+
+        return True
 
     async def _open_position_from_pending(
         self,

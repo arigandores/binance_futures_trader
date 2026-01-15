@@ -1596,3 +1596,250 @@ async def test_time_exit_fallback_without_atr(mock_storage):
 
     # ASSERT
     assert result is True, "Fallback should trigger (51m > 2×25m, PnL <= 0, no ATR)"
+
+
+# =========================================================================
+# Test Group 9: Integration Tests (3 tests)
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_integration_default_profile_unchanged_end_to_end(config_default, mock_storage):
+    """DEFAULT profile works exactly as before (no regressions) - END-TO-END test."""
+    # ARRANGE - Create PositionManager with DEFAULT profile
+    # DEFAULT has use_entry_triggers=False, so positions open immediately (no pending queue)
+    config_default.position_management.use_entry_triggers = True  # Enable for testing
+    pm = create_position_manager(config_default, mock_storage)
+
+    # Set up BTC features showing anomaly (would block WIN_RATE_MAX but not DEFAULT)
+    btc_features = create_features(
+        symbol="BTCUSDT",
+        z_er=3.5,  # BTC anomaly
+        z_vol=3.2   # BTC anomaly
+    )
+    pm.latest_features["BTCUSDT"] = btc_features
+
+    # Create ETHUSDT bar and features
+    eth_bar = create_bar(symbol="ETHUSDT", close=2000.0, notional=200000.0, trades=150)
+    pm.latest_bars["ETHUSDT"] = eth_bar
+
+    eth_features = create_features(symbol="ETHUSDT", z_er=3.5, z_vol=3.2, beta=0.8)
+    pm.latest_features["ETHUSDT"] = eth_features
+
+    # Create event that would trigger position
+    event = Event(
+        event_id="test_integration_1",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED,
+        metrics={'z_er': 3.5, 'z_vol': 3.2, 'beta': 0.8}
+    )
+
+    # ACT - Create pending signal (simulates _handle_alerts flow)
+    await pm._create_pending_signal(event)
+
+    # ASSERT - Pending signal created (NOT blocked by market regime filters)
+    # DEFAULT profile should NOT run WIN_RATE_MAX filters, so signal is created even with BTC anomaly
+    assert len(pm.pending_signals) == 1, "DEFAULT profile should create pending (not blocked by WIN_RATE_MAX filters)"
+
+    # Verify signal details
+    signal_id = list(pm.pending_signals.keys())[0]
+    pending = pm.pending_signals[signal_id]
+    assert pending.symbol == "ETHUSDT"
+    assert pending.direction == Direction.UP
+    assert pending.signal_z_er == 3.5
+
+
+@pytest.mark.asyncio
+async def test_integration_win_rate_max_requires_re_expansion(config_win_rate_max, mock_storage):
+    """WIN_RATE_MAX REQUIRES re-expansion for entry - END-TO-END test."""
+    # ARRANGE - Create PositionManager with WIN_RATE_MAX profile
+    config_win_rate_max.position_management.use_entry_triggers = True
+    config_win_rate_max.position_management.entry_trigger_z_cooldown = 2.0
+    config_win_rate_max.position_management.entry_trigger_pullback_pct = 0.5
+    config_win_rate_max.position_management.entry_trigger_taker_stability = 0.10
+    config_win_rate_max.position_management.entry_trigger_min_taker_dominance = 0.55
+    config_win_rate_max.position_management.entry_trigger_require_data = True
+
+    # Enable re-expansion requirement
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_price_action = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_micro_impulse = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_flow_acceleration = True
+
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create BTC features (no anomaly, passes filter)
+    btc_features = create_features(symbol="BTCUSDT", z_er=2.0, z_vol=2.0)
+    pm.latest_features["BTCUSDT"] = btc_features
+
+    # Create pending signal manually (bypass creation to test triggers)
+    event = Event(
+        event_id="test_integration_2",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED,
+        metrics={'z_er': 3.5, 'z_vol': 3.2}
+    )
+
+    current_ts = int(datetime.now().timestamp() * 1000)
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=current_ts,
+        expires_ts=current_ts + 600000,
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0,
+        peak_since_signal=2010.0  # Peak was 2010
+    )
+
+    pm.pending_signals["ETHUSDT_test_UP"] = pending
+
+    # Create bar/features where DEFAULT triggers met but re-expansion NOT met
+    eth_bar = create_bar(symbol="ETHUSDT", close=1995.0, taker_buy_share=0.60)  # Pulled back from 2010
+    eth_bar.ts_minute = current_ts
+    pm.latest_bars["ETHUSDT"] = eth_bar
+
+    # Add to bars window for re-expansion check
+    prev_bar = create_bar(symbol="ETHUSDT", close=1990.0)
+    prev_bar.high = 1998.0  # Previous high
+    pm.extended_features.bars_windows["ETHUSDT"] = deque([prev_bar, eth_bar], maxlen=100)
+
+    # Features: z-score cooled to 2.5 (in range [2.0, 3.0])
+    eth_features = create_features(symbol="ETHUSDT", z_er=2.5, z_vol=2.8, beta=0.8)
+    eth_features.ts_minute = current_ts
+    pm.latest_features["ETHUSDT"] = eth_features
+
+    # Mock extended features for stability check
+    pm.extended_features.get_taker_flow_stability = lambda symbol, lookback_bars: 0.05  # Stable
+
+    # Mock re-expansion methods to return False (no expansion confirmed)
+    pm.extended_features.get_bar_return = lambda symbol: -0.002  # Negative return (fails micro impulse for LONG)
+    pm.extended_features.get_flow_acceleration_bars = lambda symbol, lookback: [0.60, 0.58, 0.56]  # Decreasing (fails flow accel)
+    # Price action fails: close (1995) NOT > prev_high (1998)
+
+    # ACT - Evaluate triggers
+    triggers_met = await pm._evaluate_pending_triggers(pending, eth_bar, eth_features)
+
+    # ASSERT - Entry blocked due to re-expansion failure
+    assert triggers_met is False, "WIN_RATE_MAX should BLOCK entry when re-expansion not confirmed"
+    assert pending.z_cooldown_met is True, "Z-cooldown should be met (2.5 in [2.0, 3.0])"
+    assert pending.pullback_met is True, "Pullback should be met (from 2010 to 1995 > 0.5%)"
+    assert pending.stability_met is True, "Stability+dominance should be met (0.05 < 0.10, 0.60 >= 0.55)"
+    # Re-expansion blocked entry (all 3 methods failed)
+
+
+@pytest.mark.asyncio
+async def test_integration_ttl_and_min_wait_respected(config_win_rate_max, mock_storage):
+    """Verify TTL and min_wait_bars respected in WIN_RATE_MAX flow - END-TO-END test."""
+    # ARRANGE
+    config_win_rate_max.position_management.use_entry_triggers = True
+    config_win_rate_max.position_management.entry_trigger_min_wait_bars = 1  # Require at least 1 bar wait
+    config_win_rate_max.position_management.entry_trigger_max_wait_minutes = 5  # 5 minute TTL
+    config_win_rate_max.position_management.entry_trigger_z_cooldown = 2.0
+    config_win_rate_max.position_management.entry_trigger_pullback_pct = 0.5
+    config_win_rate_max.position_management.entry_trigger_taker_stability = 0.10
+    config_win_rate_max.position_management.entry_trigger_min_taker_dominance = 0.55
+
+    # Disable re-expansion for simpler test
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = False
+
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create BTC features (no anomaly)
+    btc_features = create_features(symbol="BTCUSDT", z_er=2.0, z_vol=2.0)
+    pm.latest_features["BTCUSDT"] = btc_features
+
+    # Create pending signal
+    event = Event(
+        event_id="test_integration_3",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED,
+        metrics={'z_er': 3.5, 'z_vol': 3.2}
+    )
+
+    current_ts = int(datetime.now().timestamp() * 1000)
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=current_ts,
+        expires_ts=current_ts + (5 * 60 * 1000),  # 5 minute TTL
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0,
+        peak_since_signal=2010.0
+    )
+
+    pm.pending_signals["ETHUSDT_test_UP"] = pending
+
+    # Mock extended features for stability
+    pm.extended_features.get_taker_flow_stability = lambda symbol, lookback_bars: 0.05
+
+    # --- Bar 0: First bar after signal creation (bars_since_signal will be 0 before check) ---
+    # Set min_wait_bars=2 to test blocking behavior more clearly
+    config_win_rate_max.position_management.entry_trigger_min_wait_bars = 2
+
+    bar0 = create_bar(symbol="ETHUSDT", close=1995.0, taker_buy_share=0.60)
+    bar0.ts_minute = current_ts
+    pm.latest_bars["ETHUSDT"] = bar0
+
+    features0 = create_features(symbol="ETHUSDT", z_er=2.5, z_vol=2.8, beta=0.8)
+    features0.ts_minute = current_ts
+    pm.latest_features["ETHUSDT"] = features0
+
+    # ACT - Check bar 0
+    await pm._check_pending_signals("ETHUSDT", bar0)
+
+    # ASSERT - Entry blocked (min_wait_bars not reached)
+    assert len(pm.pending_signals) == 1, "Should NOT enter on bar 0 (min_wait_bars=2 not reached)"
+    assert pending.bars_since_signal == 1, "bars_since_signal should increment to 1"
+
+    # --- Bar 1: Still blocked (bars_since_signal=2 needed) ---
+    bar1 = create_bar(symbol="ETHUSDT", close=1998.0, taker_buy_share=0.60)
+    bar1.ts_minute = current_ts + 60000  # 1 minute later
+    pm.latest_bars["ETHUSDT"] = bar1
+
+    features1 = create_features(symbol="ETHUSDT", z_er=2.5, z_vol=2.8, beta=0.8)
+    features1.ts_minute = current_ts + 60000
+    pm.latest_features["ETHUSDT"] = features1
+
+    # ACT - Check bar 1
+    await pm._check_pending_signals("ETHUSDT", bar1)
+
+    # ASSERT - Entry allowed (min_wait_bars reached)
+    assert len(pm.pending_signals) == 0, "Should ENTER on bar 1 (min_wait_bars=2 reached after increment, all triggers met)"
+    assert len(pm.open_positions) == 1, "Position should be opened"
+
+    # --- Bar 10 (expired): Check TTL expiry ---
+    # Create new pending for expiry test
+    pending_expired = PendingSignal(
+        signal_id="ETHUSDT_test_expired",
+        event=event,
+        created_ts=current_ts,
+        expires_ts=current_ts + (5 * 60 * 1000),  # Expires in 5 minutes
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=2000.0,
+        peak_since_signal=2010.0
+    )
+    pm.pending_signals["ETHUSDT_test_expired"] = pending_expired
+
+    # Bar 10 minutes later (past TTL)
+    bar_expired = create_bar(symbol="ETHUSDT", close=2005.0)
+    bar_expired.ts_minute = current_ts + (10 * 60 * 1000)  # 10 minutes later (> 5min TTL)
+
+    # ACT - Check expired bar
+    await pm._check_pending_signals("ETHUSDT", bar_expired)
+
+    # ASSERT - Pending signal removed (TTL expired)
+    assert "ETHUSDT_test_expired" not in pm.pending_signals, "Should remove pending on TTL expiry"
