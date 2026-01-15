@@ -69,6 +69,195 @@ diffusion:
   mode: "after_initiator"  # Only followers AFTER initiator trigger
   # alternative: "symmetric_window" - would allow ±window around initiator
 
+position_management:
+  enabled: true  # Enable virtual position tracking
+  allow_multiple_positions: false  # Only one position per symbol at a time
+
+  # Entry Triggers (Signal+Trigger separation) - FIXED ARCHITECTURE
+  use_entry_triggers: true  # Enable pending signals queue (watch window)
+  entry_trigger_max_wait_minutes: 10  # Max watch window (TTL) - NOT fixed delay!
+  entry_trigger_min_wait_bars: 0  # Optional: min bars before allowing entry (0 = immediate if ready)
+  entry_trigger_z_cooldown: 2.0  # Min z-score after cooling [2.0, 3.0]
+  entry_trigger_pullback_pct: 0.5  # Required pullback % from peak_since_signal
+  entry_trigger_taker_stability: 0.10  # Max taker flow change (stability check)
+  entry_trigger_min_taker_dominance: 0.55  # Must-Fix #7: Min buy/sell dominance (0.55 = 55%)
+  entry_trigger_require_data: true  # Must-Fix #4: Fail-closed if data missing (safer)
+
+  # Dynamic Stops/Targets (IMPROVED)
+  atr_period: 10  # Shorter period for crypto volatility (was 14)
+  atr_stop_multiplier: 1.5  # Tighter stops (1.5x ATR, was 2.0x)
+  atr_target_multiplier: 3.0  # Wider targets (3x ATR for 1:2 ratio)
+  min_risk_reward_ratio: 2.0  # Minimum R:R ratio enforced
+  use_atr_stops: true  # Use ATR for dynamic stop loss
+
+  # Trailing Stop (NEW)
+  use_trailing_stop: true  # Enable trailing stops
+  trailing_stop_activation: 0.5  # Activate at 50% of TP
+  trailing_stop_distance_atr: 1.0  # Trail at 1x ATR distance
+
+  # Exit Conditions (RELAXED)
+  z_score_exit_threshold: 0.5  # More lenient (was 1.0)
+  max_hold_minutes: 120  # Allow more time (was 60)
+
+  # Order Flow Reversal - KEEP CURRENT
+  exit_on_order_flow_reversal: true  # Exit if taker buy/sell flow reverses sharply
+  order_flow_reversal_threshold: 0.15  # 15% change in taker flow triggers exit
+
+  # Opposite Signal Exit - KEEP CURRENT
+  exit_on_opposite_signal: false  # Exit if strong opposite direction signal appears
+  opposite_signal_threshold: 2.5  # Z-score threshold for opposite direction
+
+  # Legacy Fixed Stops (FALLBACK - used if ATR unavailable)
+  stop_loss_percent: 2.0
+  take_profit_percent: 4.0  # Increased from 3.0 for better R:R
+
+  # =====================================================================
+  # Profile Selection
+  # =====================================================================
+  # Options: "DEFAULT", "WIN_RATE_MAX"
+  # - DEFAULT: Balanced profile (current settings above)
+  # - WIN_RATE_MAX: Win-rate optimization (higher quality, lower frequency)
+  profile: "DEFAULT"
+
+  # =====================================================================
+  # WIN_RATE_MAX Profile Configuration
+  # =====================================================================
+  # Win-rate optimization profile targeting higher quality entries with
+  # stricter validation. Expect 30-50% fewer trades but significantly
+  # higher win rate (target: 55-65% vs 35-45% for DEFAULT).
+  #
+  # When profile: "WIN_RATE_MAX", these settings override DEFAULT values.
+  # When profile: "DEFAULT", this section is ignored.
+  # =====================================================================
+  win_rate_max_profile:
+
+    # ------------------------------------------------------------------
+    # Watch Window Configuration
+    # Shorter TTL for faster invalidation of weak setups
+    # ------------------------------------------------------------------
+    entry_trigger_max_wait_minutes: 6  # Reduced from 10 (faster invalidation)
+    entry_trigger_min_wait_bars: 1     # Require at least 1 bar confirmation
+
+    # ------------------------------------------------------------------
+    # Z-Score Cooldown Range
+    # Both min AND max bounds for tighter control of entry timing
+    # Entry only allowed when z-score cools INTO this range
+    # ------------------------------------------------------------------
+    entry_trigger_z_cooldown_min: 2.0  # Minimum z-score after cooling
+    entry_trigger_z_cooldown_max: 2.7  # Maximum z-score (reject if still overheated)
+
+    # ------------------------------------------------------------------
+    # Pullback Validation (Dual Method)
+    # Validates price structure using both fixed % AND ATR-based bounds
+    # Rejects if pullback too small (no structure) or too large (breakdown)
+    # ------------------------------------------------------------------
+    # Fixed percentage bounds
+    entry_trigger_pullback_min_pct: 0.8       # Min pullback % (structure formed)
+    entry_trigger_pullback_max_pct: 2.0       # Max pullback % (structure intact)
+    # ATR-based bounds (adapts to volatility)
+    entry_trigger_pullback_min_atr: 0.5       # Min pullback in ATR units
+    entry_trigger_pullback_max_atr: 2.2       # Max pullback in ATR units
+
+    # ------------------------------------------------------------------
+    # Taker Flow Validation
+    # Stricter thresholds for higher quality directional bias
+    # ------------------------------------------------------------------
+    entry_trigger_taker_stability: 0.06           # Max flow change 6% (was 10%)
+    entry_trigger_min_taker_dominance: 0.58       # Min dominance 58% (was 55%)
+
+    # ------------------------------------------------------------------
+    # Re-Expansion Confirmation (NEW)
+    # Ensures momentum is resuming before entry, not just cooling off
+    # At least ONE of the enabled methods must confirm
+    # ------------------------------------------------------------------
+    require_re_expansion: true                    # Enable re-expansion gate
+    # Method 1: Price action - close breaks above previous bar high (long)
+    re_expansion_price_action: true
+    # Method 2: Micro impulse - bar return in expected direction
+    re_expansion_micro_impulse: true
+    # Method 3: Flow acceleration - taker dominance increasing
+    re_expansion_flow_acceleration: true
+
+    # ------------------------------------------------------------------
+    # Enhanced Invalidation Rules
+    # Stricter rules to cut bad setups early and preserve capital
+    # ------------------------------------------------------------------
+    # Z-score invalidation: kill pending if z drops below threshold
+    invalidate_z_er_min: 1.8                      # Min z-score to stay valid
+    # Taker dominance invalidation: kill pending if dominance too weak
+    invalidate_taker_dominance_min: 0.52          # Min dominance to stay valid
+    invalidate_taker_dominance_bars: 2            # Consecutive bars below to invalidate
+
+    # ------------------------------------------------------------------
+    # Exit Parameters (Win-Rate Biased)
+    # Tighter stops, lower targets, earlier profit taking
+    # ------------------------------------------------------------------
+    atr_stop_multiplier: 1.5                      # Stop at 1.5x ATR (same as DEFAULT)
+    atr_target_multiplier: 2.0                    # Target at 2.0x ATR (was 3.0x)
+    trailing_stop_activation: 0.35                # Activate at 35% of TP (was 50%)
+    trailing_stop_distance_atr: 0.8               # Trail at 0.8x ATR (was 1.0x)
+    order_flow_reversal_threshold: 0.12           # Reversal at 12% change (was 15%)
+
+    # ------------------------------------------------------------------
+    # Partial Profit Taking (NEW)
+    # Lock in gains early to improve realized win rate
+    # ------------------------------------------------------------------
+    use_partial_profit: true                      # Enable partial profit taking
+    partial_profit_percent: 0.5                   # Close 50% of position
+    partial_profit_target_atr: 1.0                # Take partial at +1.0x ATR
+    partial_profit_move_sl_breakeven: true        # Move SL to breakeven after partial
+
+    # ------------------------------------------------------------------
+    # Time-Based Exit (NEW)
+    # Cut stagnant positions that are not performing
+    # ------------------------------------------------------------------
+    time_exit_enabled: true                       # Enable time-based exit
+    time_exit_minutes: 25                         # Max hold time without sufficient profit
+    time_exit_min_pnl_atr_mult: 0.5               # Min profit to continue (+0.5x ATR)
+
+    # ------------------------------------------------------------------
+    # Market Regime Filters (NEW)
+    # Avoid trading during unfavorable market conditions
+    # ------------------------------------------------------------------
+    # BTC Anomaly Filter: Block entries during BTC chaos
+    btc_anomaly_filter: true                      # Enable BTC anomaly detection
+    btc_anomaly_lookback_minutes: 10              # Lookback window for BTC anomaly
+
+    # Symbol Quality Filter: Block low-quality or blacklisted symbols
+    symbol_quality_filter: true                   # Enable symbol quality checks
+    symbol_blacklist: []                          # Blacklist symbols (e.g., ["DOGEUSDT", "SHIBUSDT"])
+    min_volume_usd: 100000.0                      # Min 1-minute volume in USDT
+    min_trades_per_bar: 50                        # Min trades per 1-minute bar
+
+    # Beta Quality Filter: Block symbols with unreliable beta estimates
+    beta_quality_filter: true                     # Enable beta quality checks
+    beta_min_abs: 0.1                             # Min |beta| (must have some correlation)
+    beta_max_abs: 3.0                             # Max |beta| (reject outliers)
+    beta_min_r_squared: 0.2                       # Min R-squared (future: not yet implemented)
+
+  # =====================================================================
+  # Profile Comparison Summary
+  # =====================================================================
+  # | Parameter                    | DEFAULT | WIN_RATE_MAX | Impact       |
+  # |------------------------------|---------|--------------|--------------|
+  # | max_wait_minutes             | 10      | 6            | Faster TTL   |
+  # | min_wait_bars                | 0       | 1            | Min delay    |
+  # | z_cooldown range             | 2.0+    | [2.0, 2.7]   | Tighter band |
+  # | pullback validation          | min 0.5%| [0.8%, 2.0%] | Both bounds  |
+  # | taker_stability              | 0.10    | 0.06         | Stricter     |
+  # | taker_dominance              | 0.55    | 0.58         | Stricter     |
+  # | re-expansion confirmation    | No      | Yes          | Quality gate |
+  # | enhanced invalidation        | No      | Yes          | Cut losers   |
+  # | atr_target_multiplier        | 3.0     | 2.0          | Lower target |
+  # | trailing_stop_activation     | 0.50    | 0.35         | Earlier      |
+  # | partial_profit_taking        | No      | Yes          | Lock gains   |
+  # | time_exit                    | No      | Yes (25m)    | Cut stagnant |
+  # | market_regime_filters        | No      | Yes          | Avoid chaos  |
+  # |------------------------------|---------|--------------|--------------|
+  # | Expected Win Rate            | 35-45%  | 55-65%       | +20% target  |
+  # | Expected Trade Frequency     | 100%    | 50-70%       | -30-50%      |
+  # =====================================================================
+
 runtime:
   log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
   rest_poll_sec: 60

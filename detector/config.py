@@ -127,6 +127,122 @@ class DiffusionConfig:
 
 
 @dataclass
+class WinRateMaxProfileConfig:
+    """WIN_RATE_MAX profile configuration for win-rate optimization."""
+    # Watch window (shorter than DEFAULT)
+    entry_trigger_max_wait_minutes: int = 6
+    entry_trigger_min_wait_bars: int = 1
+
+    # Z-score cooldown range (min AND max)
+    entry_trigger_z_cooldown_min: float = 2.0
+    entry_trigger_z_cooldown_max: float = 2.7
+
+    # Pullback range (min AND max)
+    entry_trigger_pullback_min_pct: float = 0.8
+    entry_trigger_pullback_max_pct: float = 2.0
+    entry_trigger_pullback_min_atr: float = 0.5
+    entry_trigger_pullback_max_atr: float = 2.2
+
+    # Taker flow (stricter)
+    entry_trigger_taker_stability: float = 0.06
+    entry_trigger_min_taker_dominance: float = 0.58
+
+    # Re-expansion confirmation (NEW)
+    require_re_expansion: bool = True
+    re_expansion_price_action: bool = True
+    re_expansion_micro_impulse: bool = True
+    re_expansion_flow_acceleration: bool = True
+
+    # Invalidation thresholds (NEW)
+    invalidate_z_er_min: float = 1.8
+    invalidate_taker_dominance_min: float = 0.52
+    invalidate_taker_dominance_bars: int = 2
+
+    # Exit parameters (win-rate biased)
+    atr_stop_multiplier: float = 1.5
+    atr_target_multiplier: float = 2.0  # Reduced from 3.0
+    trailing_stop_activation: float = 0.35  # Reduced from 0.50
+    trailing_stop_distance_atr: float = 0.8  # Reduced from 1.0
+    order_flow_reversal_threshold: float = 0.12  # Reduced from 0.15
+
+    # Partial profit taking (NEW)
+    use_partial_profit: bool = True
+    partial_profit_percent: float = 0.5
+    partial_profit_target_atr: float = 1.0
+    partial_profit_move_sl_breakeven: bool = True
+
+    # Time exit (NEW)
+    time_exit_enabled: bool = True
+    time_exit_minutes: int = 25
+    time_exit_min_pnl_atr_mult: float = 0.5
+
+    # Market regime gating (NEW)
+    btc_anomaly_filter: bool = True
+    btc_anomaly_lookback_minutes: int = 15
+
+    # Symbol quality filter
+    symbol_quality_filter: bool = True
+    symbol_blacklist: List[str] = field(default_factory=list)
+    min_volume_usd: float = 100000.0  # Minimum 1m volume in USD
+    min_trades_per_bar: int = 50  # Minimum trades per 1m bar
+
+    # Beta quality filter (optional)
+    beta_quality_filter: bool = False
+    beta_min_r_squared: float = 0.2
+    beta_min_abs: float = 0.1  # Renamed from beta_min_value for clarity
+    beta_max_abs: float = 3.0  # Renamed from beta_max_value for clarity
+
+
+@dataclass
+class PositionManagementConfig:
+    """Virtual position management configuration."""
+    enabled: bool = True
+    allow_multiple_positions: bool = False  # Allow multiple positions per symbol
+
+    # Profile selection
+    profile: str = "DEFAULT"  # Options: "DEFAULT", "WIN_RATE_MAX"
+
+    # Entry Triggers (Signal+Trigger separation) - FIXED ARCHITECTURE
+    use_entry_triggers: bool = False  # Enable pending signals queue (watch window)
+    entry_trigger_max_wait_minutes: int = 10  # Max watch window (TTL) - NOT fixed delay!
+    entry_trigger_min_wait_bars: int = 0  # Optional: min bars before allowing entry (0 = immediate if ready)
+    entry_trigger_z_cooldown: float = 2.0  # Min z-score after cooling [2.0, 3.0]
+    entry_trigger_pullback_pct: float = 0.5  # Required pullback % from peak_since_signal
+    entry_trigger_taker_stability: float = 0.10  # Max taker flow change (stability check)
+    entry_trigger_min_taker_dominance: float = 0.55  # Must-Fix #7: Min buy/sell dominance (0.55 = 55%)
+    entry_trigger_require_data: bool = True  # Must-Fix #4: Fail-closed if data missing (safer)
+
+    # Dynamic Stops/Targets (IMPROVED)
+    atr_period: int = 10  # Shorter period for crypto volatility (was 14)
+    atr_stop_multiplier: float = 1.5  # Tighter stops (1.5x ATR, was 2.0x)
+    atr_target_multiplier: float = 3.0  # Wider targets (3x ATR for 1:2 ratio)
+    min_risk_reward_ratio: float = 2.0  # Minimum R:R ratio enforced
+    use_atr_stops: bool = True
+
+    # Trailing Stop (NEW)
+    use_trailing_stop: bool = False  # Enable trailing stops
+    trailing_stop_activation: float = 0.5  # Activate at 50% of TP
+    trailing_stop_distance_atr: float = 1.0  # Trail at 1x ATR distance
+
+    # Exit Conditions (RELAXED)
+    z_score_exit_threshold: float = 0.5  # More lenient (was 1.0)
+    stop_loss_percent: float = 2.0  # Used if ATR unavailable
+    take_profit_percent: float = 4.0  # Increased from 3.0 for better R:R
+    max_hold_minutes: int = 120  # Allow more time (was 60)
+
+    # Order Flow Reversal
+    exit_on_order_flow_reversal: bool = True
+    order_flow_reversal_threshold: float = 0.15  # 15% change in taker flow
+
+    # Opposite Signal Exit
+    exit_on_opposite_signal: bool = False
+    opposite_signal_threshold: float = 2.5  # Z-score threshold for opposite direction
+
+    # WIN_RATE_MAX profile configuration
+    win_rate_max_profile: WinRateMaxProfileConfig = field(default_factory=WinRateMaxProfileConfig)
+
+
+@dataclass
 class RuntimeConfig:
     """Runtime configuration."""
     log_level: str = "INFO"
@@ -145,6 +261,7 @@ class Config:
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    position_management: PositionManagementConfig = field(default_factory=PositionManagementConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @classmethod
@@ -196,6 +313,14 @@ class Config:
 
         if 'diffusion' in data:
             config.diffusion = DiffusionConfig(**data['diffusion'])
+
+        if 'position_management' in data:
+            pm_data = data['position_management']
+            # Parse WIN_RATE_MAX profile if present
+            if 'win_rate_max_profile' in pm_data:
+                win_rate_cfg = WinRateMaxProfileConfig(**pm_data['win_rate_max_profile'])
+                pm_data['win_rate_max_profile'] = win_rate_cfg
+            config.position_management = PositionManagementConfig(**pm_data)
 
         if 'runtime' in data:
             config.runtime = RuntimeConfig(**data['runtime'])
