@@ -11,6 +11,7 @@ from detector.aggregator import BarAggregator
 from detector.features import FeatureCalculator
 from detector.detector import AnomalyDetector
 from detector.alerts import AlertDispatcher
+from detector.position_manager import PositionManager
 from detector.report import ReportGenerator
 from detector.backfill import Backfiller
 from detector.utils import setup_logging
@@ -46,8 +47,11 @@ class SectorShotDetector:
         # Queues
         self.tick_queue = asyncio.Queue(maxsize=10000)
         self.bar_queue = asyncio.Queue(maxsize=1000)
+        self.bar_queue_pm = asyncio.Queue(maxsize=1000)  # Separate queue for position manager
         self.feature_queue = asyncio.Queue(maxsize=1000)
+        self.feature_queue_pm = asyncio.Queue(maxsize=1000)  # For position manager exit checks
         self.event_queue = asyncio.Queue(maxsize=100)
+        self.event_queue_pm = asyncio.Queue(maxsize=100)  # For position manager to open positions
 
         # Components
         self.ws_client = BinanceWebSocketClient(
@@ -65,15 +69,22 @@ class SectorShotDetector:
             self.tick_queue,
             self.bar_queue,
             config.universe.all_symbols,
-            config.runtime.clock_skew_tolerance_sec
+            self.rest_client,
+            config.runtime.clock_skew_tolerance_sec,
+            extra_bar_queues=[self.bar_queue_pm]  # Broadcast bars to position manager
         )
+
+        # Prepare extra queues for broadcasting (if position manager enabled)
+        extra_feature_queues = [self.feature_queue_pm] if config.position_management.enabled else []
+        extra_event_queues = [self.event_queue_pm] if config.position_management.enabled else []
 
         self.features = FeatureCalculator(
             self.bar_queue,
             self.feature_queue,
             self.storage,
             self.rest_client,
-            config
+            config,
+            extra_feature_queues=extra_feature_queues
         )
 
         self.detector = AnomalyDetector(
@@ -81,10 +92,22 @@ class SectorShotDetector:
             self.event_queue,
             self.rest_client,
             self.storage,
-            config
+            config,
+            extra_event_queues=extra_event_queues
         )
 
         self.alerts = AlertDispatcher(self.event_queue, config)
+
+        # Position manager (if enabled)
+        self.position_manager = None
+        if config.position_management.enabled:
+            self.position_manager = PositionManager(
+                self.event_queue_pm,
+                self.feature_queue_pm,
+                self.bar_queue_pm,
+                self.storage,
+                config
+            )
 
     async def _check_and_backfill(self) -> None:
         """Check if database has sufficient and recent historical data, backfill if needed."""
@@ -128,20 +151,55 @@ class SectorShotDetector:
                 logger.info("Data is recent and sufficient, skipping backfill")
 
         if not should_backfill:
+            # Even if we skip klines backfill, check if we should backfill OI
+            # (In case bars exist but OI is missing)
+            await self._backfill_oi_if_needed(hours_needed=13)
             return
 
-        # Need to backfill
+        # Need to backfill klines
         hours_needed = (needed_bars + 60) // 60  # Convert bars to hours, add 1 hour buffer
         logger.info(f"Starting automatic backfill of {hours_needed} hours of historical data...")
         logger.info("This will take 1-2 minutes. Please wait...")
 
         try:
             backfiller = Backfiller(self.rest_client, self.storage)
+
+            # Step 1: Backfill klines
             await backfiller.backfill_symbols(self.config.universe.all_symbols, hours=hours_needed)
+            logger.info("Klines backfill complete!")
+
+            # Step 2: Backfill OI data
+            await self._backfill_oi_if_needed(hours_needed)
+
             logger.info("Automatic backfill complete!")
         except Exception as e:
             logger.error(f"Backfill failed: {e}")
             logger.warning("Continuing with limited data. Z-scores may be unstable initially.")
+
+    async def _backfill_oi_if_needed(self, hours_needed: int) -> None:
+        """
+        Backfill OI data if API key is available.
+
+        This is a separate step because:
+        1. OI backfill is optional (requires API key)
+        2. May be called even when klines are already present
+        """
+        if not self.rest_client.api_key:
+            logger.info("Skipping OI backfill (no API key)")
+            return
+
+        logger.info(f"Starting OI backfill for {hours_needed} hours...")
+
+        try:
+            backfiller = Backfiller(self.rest_client, self.storage)
+            await backfiller.backfill_oi_for_symbols(
+                self.config.universe.all_symbols,
+                hours=hours_needed
+            )
+            logger.info("OI backfill complete!")
+        except Exception as e:
+            logger.error(f"OI backfill failed: {e}")
+            logger.warning("Continuing without OI data. Events will have z_oi_delta_1h = None")
 
     async def run(self) -> None:
         """Main entry point - start all components."""
@@ -172,6 +230,11 @@ class SectorShotDetector:
             asyncio.create_task(self._health_monitor(), name="health"),
         ]
 
+        # Add position manager if enabled
+        if self.position_manager:
+            tasks.append(asyncio.create_task(self.position_manager.run(), name="position_manager"))
+            logger.info("Position manager enabled")
+
         logger.info("All components started. Press Ctrl+C to stop.")
 
         # Wait for shutdown signal
@@ -187,6 +250,9 @@ class SectorShotDetector:
         await self.storage.close()
         await self.rest_client.close()
         await self.alerts.close()
+
+        if self.position_manager:
+            await self.position_manager.close()
 
         logger.info("Shutdown complete")
 
@@ -206,14 +272,21 @@ class SectorShotDetector:
             await asyncio.sleep(60)
 
             try:
-                logger.info(
-                    "Health check",
-                    tick_q=self.tick_queue.qsize(),
-                    bar_q=self.bar_queue.qsize(),
-                    feature_q=self.feature_queue.qsize(),
-                    event_q=self.event_queue.qsize(),
-                    ws_connected=self.ws_client.is_connected
-                )
+                health_info = {
+                    "tick_q": self.tick_queue.qsize(),
+                    "bar_q": self.bar_queue.qsize(),
+                    "feature_q": self.feature_queue.qsize(),
+                    "event_q": self.event_queue.qsize(),
+                    "ws_connected": self.ws_client.is_connected
+                }
+
+                if self.position_manager:
+                    health_info["open_positions"] = len(self.position_manager.open_positions)
+                    health_info["bar_q_pm"] = self.bar_queue_pm.qsize()
+                    health_info["feature_q_pm"] = self.feature_queue_pm.qsize()
+
+                logger.info("Health check", **health_info)
+
             except Exception as e:
                 logger.error(f"Error in health monitor: {e}")
 

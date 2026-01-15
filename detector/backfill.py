@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import List
+from typing import List, Dict
 from datetime import datetime, timedelta
 from detector.models import Bar
 from detector.storage import Storage
@@ -171,7 +171,8 @@ class Backfiller:
                 spread_bps=None,
                 mark=None,
                 funding=None,
-                next_funding_ts=None
+                next_funding_ts=None,
+                oi=None  # Will be populated by OI backfill
             )
 
             return bar
@@ -179,3 +180,131 @@ class Backfiller:
         except (IndexError, ValueError, TypeError) as e:
             logger.error(f"Error parsing kline for {symbol}: {e}")
             return None
+
+    async def backfill_oi_for_symbols(self, symbols: List[str], hours: int = 13) -> None:
+        """
+        Backfill historical OI data for all symbols.
+
+        Fetches OI history from REST API (5m resolution) and updates existing bars.
+        Uses forward-fill to map 5m OI data to 1m bars.
+
+        Args:
+            symbols: List of symbols to backfill
+            hours: Number of hours to backfill (default 13 to match klines backfill)
+        """
+        logger.info(f"Starting OI backfill for {len(symbols)} symbols, {hours} hours of data")
+
+        # Calculate how many 5m periods needed
+        periods_5m = (hours * 60) // 5  # Convert hours to 5-minute periods
+        limit = min(periods_5m, 500)  # Binance API limit is 500
+
+        total_bars_updated = 0
+        failed_symbols = []
+
+        for symbol in symbols:
+            try:
+                # Fetch OI history from REST API
+                oi_data = await self.rest_client.get_oi_history(
+                    symbol=symbol,
+                    period="5m",
+                    limit=limit
+                )
+
+                if not oi_data:
+                    logger.warning(f"No OI data received for {symbol} (may not have API key)")
+                    failed_symbols.append(symbol)
+                    continue
+
+                # Convert OI data to 1m bar updates
+                bars_updated = await self._update_bars_with_oi(symbol, oi_data)
+
+                total_bars_updated += bars_updated
+                logger.info(f"Updated {bars_updated} bars with OI for {symbol}")
+
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"Error backfilling OI for {symbol}: {e}")
+                failed_symbols.append(symbol)
+
+        logger.info(f"OI backfill complete: {total_bars_updated} bars updated for {len(symbols) - len(failed_symbols)}/{len(symbols)} symbols")
+
+        if failed_symbols:
+            logger.warning(f"Failed to backfill OI for: {', '.join(failed_symbols)}")
+
+    async def _update_bars_with_oi(self, symbol: str, oi_data: List[Dict]) -> int:
+        """
+        Update existing bars with OI data using forward-fill strategy.
+
+        OI data is at 5m resolution, bars are at 1m resolution.
+        Forward-fill: each 5m OI value is applied to the next 5 consecutive 1m bars.
+
+        Args:
+            symbol: Symbol to update
+            oi_data: List of OI history entries from Binance API
+                     Format: [{'timestamp': ms, 'sumOpenInterest': float, ...}, ...]
+
+        Returns:
+            Number of bars updated
+        """
+        if not oi_data:
+            return 0
+
+        # Build OI lookup map: timestamp -> oi_value
+        # Each OI timestamp represents the START of a 5m period
+        oi_map = {}
+        for entry in oi_data:
+            ts_ms = int(entry['timestamp'])
+            oi_value = float(entry.get('sumOpenInterest', 0))
+            oi_map[ts_ms] = oi_value
+
+        # Fetch existing bars for this symbol in the same time range
+        # Get time range from OI data
+        if not oi_map:
+            return 0
+
+        start_ts = min(oi_map.keys())
+        end_ts = max(oi_map.keys()) + 5 * 60 * 1000  # Add 5m to cover last period
+
+        # Load bars from database in this range
+        bars_to_update = []
+
+        try:
+            async with self.storage.db.execute("""
+                SELECT symbol, ts_minute FROM bars_1m
+                WHERE symbol = ? AND ts_minute >= ? AND ts_minute < ?
+                ORDER BY ts_minute ASC
+            """, (symbol, start_ts, end_ts)) as cursor:
+                rows = await cursor.fetchall()
+
+            # For each 1m bar, find the corresponding 5m OI value using forward-fill
+            bars_updated = 0
+
+            for row in rows:
+                bar_symbol = row[0]
+                bar_ts = row[1]
+
+                # Find the OI value for this bar
+                # Round down to nearest 5m boundary to find the OI period
+                oi_period_start = (bar_ts // (5 * 60 * 1000)) * (5 * 60 * 1000)
+
+                oi_value = oi_map.get(oi_period_start)
+
+                if oi_value is not None:
+                    # Update this bar with OI value
+                    bars_to_update.append((oi_value, bar_symbol, bar_ts))
+                    bars_updated += 1
+
+            # Batch update bars
+            if bars_to_update:
+                await self.storage.db.executemany("""
+                    UPDATE bars_1m SET oi = ? WHERE symbol = ? AND ts_minute = ?
+                """, bars_to_update)
+                await self.storage.db.commit()
+
+            return bars_updated
+
+        except Exception as e:
+            logger.error(f"Error updating bars with OI for {symbol}: {e}")
+            return 0

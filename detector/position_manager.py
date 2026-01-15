@@ -357,6 +357,11 @@ class PositionManager:
             f"(will enter AS SOON AS triggers met)"
         )
 
+        # Send Telegram notification
+        if self.config.alerts.telegram.enabled:
+            message = self._format_pending_signal_created(pending, event)
+            await self._send_telegram(message)
+
     async def _check_pending_signals(self, symbol: str, bar: Bar) -> None:
         """
         Check if any pending signals for this symbol can trigger entry.
@@ -391,6 +396,10 @@ class PositionManager:
                             f"Reason: {pending.invalidation_reason} | "
                             f"Duration: {pending.bars_since_signal} bars"
                         )
+                        # Send Telegram notification
+                        if self.config.alerts.telegram.enabled:
+                            message = self._format_pending_signal_invalidated(pending)
+                            await self._send_telegram(message)
                     continue  # Skip to next pending
 
                 # Must-Fix #10: Only increment bars_since_signal ONCE per bar (idempotent)
@@ -412,6 +421,10 @@ class PositionManager:
                             f"Pending signal expired: {signal_id} "
                             f"(triggers not met within {cfg.entry_trigger_max_wait_minutes}m)"
                         )
+                        # Send Telegram notification
+                        if self.config.alerts.telegram.enabled:
+                            message = self._format_pending_signal_expired(pending, cfg.entry_trigger_max_wait_minutes)
+                            await self._send_telegram(message)
                     continue
 
                 # Check min_wait_bars (optional filter to avoid same-bar entry)
@@ -739,6 +752,10 @@ class PositionManager:
                             f"(TTL: {self.config.position_management.entry_trigger_max_wait_minutes}m, "
                             f"bars evaluated: {pending.bars_since_signal})"
                         )
+                        # Send Telegram notification
+                        if self.config.alerts.telegram.enabled:
+                            message = self._format_pending_signal_expired(pending, self.config.position_management.entry_trigger_max_wait_minutes)
+                            await self._send_telegram(message)
 
     async def _open_position(self, event: Event) -> None:
         """
@@ -848,7 +865,7 @@ class PositionManager:
 
         for position in positions_to_check:
             # WIN_RATE_MAX: Execute partial profit if target reached (before exit checks)
-            self._execute_partial_profit(position, bar.close, bar.ts_minute)
+            await self._execute_partial_profit(position, bar.close, bar.ts_minute)
 
             # Update trailing stop
             await self._update_trailing_stop(position, bar.close, features)
@@ -1450,7 +1467,7 @@ class PositionManager:
         else:  # Direction.DOWN
             return ((position.open_price - current_price) / position.open_price) * 100
 
-    def _execute_partial_profit(
+    async def _execute_partial_profit(
         self,
         position: Position,
         current_price: float,
@@ -1518,6 +1535,11 @@ class PositionManager:
                 logger.info(
                     f"{position.symbol}: Stop loss moved to breakeven ({position.open_price:.6f})"
                 )
+
+            # Send Telegram notification
+            if self.config.alerts.telegram.enabled:
+                message = self._format_partial_profit_executed(position, current_price, current_pnl_pct)
+                await self._send_telegram(message)
 
             return True
 
@@ -1948,6 +1970,130 @@ class PositionManager:
 
 ⏰ {open_time} → {close_time}
 🆔 {position.position_id}
+"""
+
+        return message
+
+    def _format_pending_signal_created(self, pending: PendingSignal, event: Event) -> str:
+        """Format message for pending signal created."""
+        timestamp = datetime.fromtimestamp(pending.created_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+
+        direction_emoji = "🟢" if pending.direction == Direction.UP else "🔴"
+        status_emoji = "✅" if event.status == EventStatus.CONFIRMED else "⚠️"
+
+        message = f"""⏳ <b>PENDING SIGNAL CREATED</b>
+
+{direction_emoji} <b>{pending.symbol} {pending.direction.value}</b>
+{status_emoji} Status: {event.status.value}
+
+📊 <b>Signal Metrics:</b>
+   • Z-Score (ER): {pending.signal_z_er:.2f}σ
+   • Z-Score (VOL): {pending.signal_z_vol:.2f}σ
+   • Price: {format_price(pending.signal_price)}
+   • Peak: {format_price(pending.peak_since_signal)}
+
+⏱️ <b>Watch Window:</b>
+   • Max wait: {self.config.position_management.entry_trigger_max_wait_minutes}m
+   • Will enter AS SOON AS triggers met:
+      - Z-score cooldown ✓
+      - Price pullback ✓
+      - Taker flow stable + dominant ✓
+
+🕐 Time: {timestamp}
+🆔 ID: {pending.signal_id}
+"""
+
+        return message
+
+    def _format_pending_signal_invalidated(self, pending: PendingSignal) -> str:
+        """Format message for pending signal invalidated."""
+        timestamp = datetime.fromtimestamp(pending.created_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+
+        direction_emoji = "🟢" if pending.direction == Direction.UP else "🔴"
+
+        message = f"""❌ <b>PENDING SIGNAL INVALIDATED</b>
+
+{direction_emoji} <b>{pending.symbol} {pending.direction.value}</b>
+
+⚠️ <b>Invalidation Reason:</b> {pending.invalidation_reason}
+
+📊 <b>Signal Metrics (at creation):</b>
+   • Z-Score (ER): {pending.signal_z_er:.2f}σ
+   • Price: {format_price(pending.signal_price)}
+   • Peak: {format_price(pending.peak_since_signal)}
+
+⏱️ <b>Duration:</b>
+   • Bars evaluated: {pending.bars_since_signal}
+   • Created: {timestamp}
+
+🆔 ID: {pending.signal_id}
+
+💡 <b>Result:</b> No position opened - signal no longer valid
+"""
+
+        return message
+
+    def _format_pending_signal_expired(self, pending: PendingSignal, max_wait_minutes: int) -> str:
+        """Format message for pending signal expired."""
+        created_time = datetime.fromtimestamp(pending.created_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+
+        direction_emoji = "🟢" if pending.direction == Direction.UP else "🔴"
+
+        message = f"""⏰ <b>PENDING SIGNAL EXPIRED</b>
+
+{direction_emoji} <b>{pending.symbol} {pending.direction.value}</b>
+
+⌛ <b>Watch Window Exceeded:</b>
+   • Max wait: {max_wait_minutes}m
+   • Bars evaluated: {pending.bars_since_signal}
+
+📊 <b>Signal Metrics (at creation):</b>
+   • Z-Score (ER): {pending.signal_z_er:.2f}σ
+   • Price: {format_price(pending.signal_price)}
+   • Peak: {format_price(pending.peak_since_signal)}
+
+🕐 Created: {created_time}
+🆔 ID: {pending.signal_id}
+
+💡 <b>Result:</b> No position opened - triggers never met within watch window
+"""
+
+        return message
+
+    def _format_partial_profit_executed(self, position: Position, price: float, pnl_pct: float) -> str:
+        """Format message for partial profit execution (WIN_RATE_MAX only)."""
+        timestamp = datetime.fromtimestamp(position.partial_profit_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+
+        direction_emoji = "🟢" if position.direction == Direction.UP else "🔴"
+
+        # Calculate duration
+        duration_ms = position.partial_profit_ts - position.open_ts
+        duration_minutes = duration_ms / (1000 * 60)
+
+        breakeven_active = position.metrics.get('breakeven_stop_active', False)
+
+        message = f"""💰 <b>PARTIAL PROFIT EXECUTED</b>
+
+{direction_emoji} <b>{position.symbol} {position.direction.value}</b>
+
+📊 <b>Profit Details:</b>
+   • Position size: 50% closed ✓
+   • Exit price: {format_price(price)}
+   • PnL: <b>+{pnl_pct:.2f}%</b>
+   • Entry price: {format_price(position.open_price)}
+
+⏱️ <b>Duration:</b> {duration_minutes:.1f}m
+
+🛡️ <b>Risk Management:</b>
+   • Remaining: 50% position size
+"""
+
+        if breakeven_active:
+            message += f"   • Stop loss moved to: {format_price(position.open_price)} (BREAKEVEN)\n"
+
+        message += f"""
+🕐 Time: {timestamp}
+🆔 ID: {position.position_id}
 """
 
         return message

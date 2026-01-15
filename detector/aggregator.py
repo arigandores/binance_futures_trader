@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 from detector.models import Bar, StreamType
 
 logger = logging.getLogger(__name__)
@@ -27,11 +27,15 @@ class BarAggregator:
         tick_queue: asyncio.Queue,
         bar_queue: asyncio.Queue,
         symbols: List[str],
-        clock_tolerance_sec: int = 2
+        rest_client: Optional['BinanceRestClient'] = None,
+        clock_tolerance_sec: int = 2,
+        extra_bar_queues: Optional[List[asyncio.Queue]] = None
     ):
         self.tick_queue = tick_queue
         self.bar_queue = bar_queue
+        self.extra_bar_queues = extra_bar_queues or []  # Additional queues for bar broadcast
         self.symbols_set = set(symbols)  # For fast lookup
+        self.rest_client = rest_client
         self.clock_tolerance_sec = clock_tolerance_sec
 
         # Current incomplete bars (one per symbol)
@@ -92,8 +96,20 @@ class BarAggregator:
             # Set bar timestamp to minute boundary
             bar.ts_minute = timestamp_ms - 60_000  # Bar represents previous minute
 
-            # Emit to queue
+            # Enrich bar with OI from REST client cache (if available)
+            if self.rest_client:
+                bar.oi = self.rest_client.get_latest_oi(symbol)
+
+            # Emit to queue(s)
             await self.bar_queue.put(bar)
+
+            # Broadcast to extra queues (for position manager, etc.)
+            for queue in self.extra_bar_queues:
+                try:
+                    await queue.put(bar)
+                except Exception as e:
+                    logger.error(f"Error broadcasting bar to extra queue: {e}")
+
             closed_count += 1
 
             # Collect summary info
@@ -174,6 +190,11 @@ class BarAggregator:
         bar = self.current_bars.get(symbol)
         if not bar:
             bar = Bar(symbol=symbol, ts_minute=0)
+            # Initialize OHLC from mid price if this is the first data for this bar
+            bar.open = mid
+            bar.high = mid
+            bar.low = mid
+            bar.close = mid
             self.current_bars[symbol] = bar
 
         bar.mid = mid
@@ -193,6 +214,12 @@ class BarAggregator:
         bar = self.current_bars.get(symbol)
         if not bar:
             bar = Bar(symbol=symbol, ts_minute=0)
+            # Initialize OHLC from mark price if this is the first data for this bar
+            if mark_price > 0:
+                bar.open = mark_price
+                bar.high = mark_price
+                bar.low = mark_price
+                bar.close = mark_price
             self.current_bars[symbol] = bar
 
         bar.mark = mark_price
@@ -216,6 +243,11 @@ class BarAggregator:
         bar = self.current_bars.get(symbol)
         if not bar:
             bar = Bar(symbol=symbol, ts_minute=0)
+            # Initialize OHLC from liquidation price if this is the first data for this bar
+            bar.open = price
+            bar.high = price
+            bar.low = price
+            bar.close = price
             self.current_bars[symbol] = bar
 
         # Accumulate liquidation notional

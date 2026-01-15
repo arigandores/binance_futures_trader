@@ -117,7 +117,7 @@ position_management:
   # Options: "DEFAULT", "WIN_RATE_MAX"
   # - DEFAULT: Balanced profile (current settings above)
   # - WIN_RATE_MAX: Win-rate optimization (higher quality, lower frequency)
-  profile: "DEFAULT"
+  profile: "WIN_RATE_MAX"
 
   # =====================================================================
   # WIN_RATE_MAX Profile Configuration

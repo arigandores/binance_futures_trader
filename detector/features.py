@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import numpy as np
 from collections import deque
 from typing import Dict, List, Optional
@@ -30,6 +31,10 @@ class RollingWindow:
         # Liquidations (if available)
         self.liq_notionals = deque(maxlen=maxlen)
 
+        # Open Interest
+        self.ois = deque(maxlen=maxlen)  # Raw OI values
+        self.oi_deltas = deque(maxlen=maxlen)  # OI delta_1h values
+
         # Derived features
         self.returns_1m = deque(maxlen=maxlen)
         self.excess_returns = deque(maxlen=maxlen)
@@ -41,6 +46,8 @@ class RollingWindow:
         self.taker_buys.append(bar.taker_buy)
         self.taker_sells.append(bar.taker_sell)
         self.liq_notionals.append(bar.liq_notional)
+        # Append OI (None if not available)
+        self.ois.append(bar.oi if bar.oi is not None else None)
 
     def is_ready(self, min_bars: int = 15) -> bool:
         """Check if window has enough data."""
@@ -66,10 +73,12 @@ class FeatureCalculator:
         feature_queue: asyncio.Queue,
         storage: Storage,
         rest_client: BinanceRestClient,
-        config: Config
+        config: Config,
+        extra_feature_queues: list = None
     ):
         self.bar_queue = bar_queue
         self.feature_queue = feature_queue
+        self.extra_feature_queues = extra_feature_queues or []
         self.storage = storage
         self.rest_client = rest_client
         self.config = config
@@ -78,54 +87,160 @@ class FeatureCalculator:
         self.windows: Dict[str, RollingWindow] = {}
 
     async def backfill(self) -> None:
-        """Load last 720 bars from DB into memory and pre-calculate excess returns."""
+        """Load ALL bars from DB, populate windows, and write features to database."""
         logger.info("Backfilling rolling windows from database...")
 
-        # First pass: Load all bars into windows
+        # First pass: Load ALL bars into windows (not just 720)
+        # This is needed to calculate features for all historical data
+        all_bars_by_symbol = {}
+
         for symbol in self.config.universe.all_symbols:
-            bars = await self.storage.get_recent_bars(symbol, limit=720)
+            # Load ALL bars from database (no limit)
+            bars = await self.storage.get_recent_bars(symbol, limit=10000)  # Large limit to get all data
+            all_bars_by_symbol[symbol] = bars
 
             window = RollingWindow(maxlen=720)
-            for bar in bars:
+            # Only keep last 720 in rolling window for memory efficiency
+            for bar in bars[-720:]:
                 window.append(bar)
 
             self.windows[symbol] = window
+            logger.debug(f"Loaded {len(bars)} bars for {symbol} (keeping {len(bars[-720:])} in rolling window)")
 
-            logger.debug(f"Backfilled {len(bars)} bars for {symbol}")
+        # Second pass: Calculate and WRITE features for ALL historical bars
+        logger.info("Calculating features for all historical data...")
 
-        # Second pass: Calculate excess returns for historical bars
-        logger.info("Pre-calculating excess returns for historical data...")
-
-        btc_window = self.windows.get(self.config.universe.benchmark_symbol)
-        if not btc_window or len(btc_window.closes) < 15:
-            logger.warning("Insufficient BTC data for excess return calculation")
+        btc_bars = all_bars_by_symbol.get(self.config.universe.benchmark_symbol, [])
+        if len(btc_bars) < 15:
+            logger.warning("Insufficient BTC data for feature calculation")
             return
 
+        # Create temporary extended windows that hold ALL bars (for backfill calculation)
+        extended_windows = {}
         for symbol in self.config.universe.all_symbols:
-            window = self.windows.get(symbol)
-            if not window or len(window.closes) < 15:
+            bars = all_bars_by_symbol.get(symbol, [])
+            if len(bars) < 15:
                 continue
 
-            # Calculate excess returns for each historical bar
-            for i in range(15, len(window.closes)):
-                # Calculate 15m return for this bar
-                r_15m = self._calculate_return_at_index(window.closes, i, lookback=15)
+            extended_window = RollingWindow(maxlen=len(bars) + 100)  # Large enough for all bars
+            for bar in bars:
+                extended_window.append(bar)
+            extended_windows[symbol] = extended_window
 
-                # Calculate beta (using available data up to this point)
-                beta = self._calculate_beta_at_index(symbol, i)
+        # BTC extended window
+        btc_extended_window = extended_windows.get(self.config.universe.benchmark_symbol)
+        if not btc_extended_window:
+            logger.warning("No BTC extended window available")
+            return
+
+        # Calculate features for each symbol
+        total_features_written = 0
+
+        for symbol in self.config.universe.all_symbols:
+            bars = all_bars_by_symbol.get(symbol, [])
+            extended_window = extended_windows.get(symbol)
+
+            if not extended_window or len(bars) < 15:
+                continue
+
+            features_batch = []
+
+            # Calculate features for each historical bar (starting from bar 15)
+            for i in range(15, len(bars)):
+                bar = bars[i]
+
+                # Calculate returns
+                r_1m = self._calculate_return_at_index(extended_window.closes, i, lookback=1)
+                r_15m = self._calculate_return_at_index(extended_window.closes, i, lookback=15)
+
+                # Calculate beta
+                beta = self._calculate_beta_at_index_extended(symbol, i, extended_windows)
 
                 # Calculate BTC 15m return
-                btc_r_15m = self._calculate_return_at_index(btc_window.closes, i, lookback=15)
+                btc_r_15m = self._calculate_return_at_index(btc_extended_window.closes, i, lookback=15)
 
                 # Calculate excess return
                 er_15m = r_15m - beta * btc_r_15m
 
-                # Store in window
-                window.excess_returns.append(er_15m)
+                # Store excess return in extended window for z-score calculation
+                extended_window.excess_returns.append(er_15m)
 
-            logger.debug(f"Pre-calculated {len(window.excess_returns)} excess returns for {symbol}")
+                # Calculate z-scores
+                z_er_15m = self._robust_zscore(list(extended_window.excess_returns))
+                z_vol_15m = self._robust_zscore(list(extended_window.volumes)[:i+1])
 
-        logger.info(f"Backfilled rolling windows for {len(self.windows)} symbols with excess returns")
+                # Volume sum over last 15 bars
+                vol_15m = sum(list(extended_window.volumes)[max(0, i-14):i+1])
+
+                # Taker buy share
+                taker_buy_share_15m = self._calculate_taker_share_at_index(extended_window, i, lookback=15)
+
+                # OI delta (if available)
+                oi_delta_1h = None
+                z_oi_delta_1h = None
+                if i >= 60 and len(extended_window.ois) > i:
+                    oi_current = list(extended_window.ois)[i]
+                    oi_1h_ago = list(extended_window.ois)[i - 60]
+                    if oi_current is not None and oi_1h_ago is not None:
+                        oi_delta_1h = oi_current - oi_1h_ago
+                        extended_window.oi_deltas.append(oi_delta_1h)
+
+                        if len(extended_window.oi_deltas) >= 60:
+                            z_oi_delta_1h = self._robust_zscore(list(extended_window.oi_deltas))
+
+                # Liquidation sum
+                liq_15m = sum(list(extended_window.liq_notionals)[max(0, i-14):i+1])
+                z_liq_15m = self._robust_zscore(list(extended_window.liq_notionals)[:i+1]) if liq_15m > 0 else 0
+
+                # Create features object
+                features = Features(
+                    symbol=symbol,
+                    ts_minute=bar.ts_minute,
+                    r_1m=r_1m,
+                    r_15m=r_15m,
+                    beta=beta,
+                    er_15m=er_15m,
+                    z_er_15m=z_er_15m,
+                    vol_15m=vol_15m,
+                    z_vol_15m=z_vol_15m,
+                    taker_buy_share_15m=taker_buy_share_15m,
+                    oi_delta_1h=oi_delta_1h,
+                    z_oi_delta_1h=z_oi_delta_1h,
+                    liq_15m=liq_15m,
+                    z_liq_15m=z_liq_15m,
+                    funding_rate=bar.funding
+                )
+
+                features.direction = features.determine_direction()
+                features_batch.append(features)
+
+            # Write features to database in batches
+            if features_batch:
+                await self.storage.batch_write_features(features_batch)
+                await self.storage.flush_all()
+                total_features_written += len(features_batch)
+                logger.info(f"Wrote {len(features_batch)} features for {symbol}")
+
+        # Now populate the actual rolling windows with pre-calculated excess returns and OI deltas
+        logger.info("Populating rolling windows with pre-calculated data...")
+
+        for symbol in self.config.universe.all_symbols:
+            extended_window = extended_windows.get(symbol)
+            window = self.windows.get(symbol)
+
+            if not extended_window or not window:
+                continue
+
+            # Copy last 720 excess returns and OI deltas to the actual rolling window
+            if len(extended_window.excess_returns) > 0:
+                for er in list(extended_window.excess_returns)[-720:]:
+                    window.excess_returns.append(er)
+
+            if len(extended_window.oi_deltas) > 0:
+                for oi_delta in list(extended_window.oi_deltas)[-720:]:
+                    window.oi_deltas.append(oi_delta)
+
+        logger.info(f"Backfill complete: {total_features_written} features written to database for {len(self.windows)} symbols")
 
     async def run(self) -> None:
         """Consume bars and calculate features."""
@@ -146,6 +261,14 @@ class FeatureCalculator:
                     # Write features to storage buffer
                     await self.storage.batch_write_features([features])
                     await self.feature_queue.put(features)
+
+                    # Broadcast to extra queues (e.g. position manager)
+                    for queue in self.extra_feature_queues:
+                        try:
+                            await queue.put(features)
+                        except Exception as e:
+                            logger.error(f"Error broadcasting features to extra queue: {e}")
+
                     bar_count += 1
 
                     # Log every 10 features calculated
@@ -200,9 +323,20 @@ class FeatureCalculator:
         # Taker buy share (over last 15 bars)
         taker_buy_share_15m = self._calculate_taker_share(window, lookback=15)
 
-        # OI delta (from REST client)
-        oi_delta_1h = self.rest_client.get_oi_delta_1h(symbol)
-        z_oi_delta_1h = None  # Would need historical OI deltas to calculate z-score
+        # OI delta and z-score calculation
+        oi_delta_1h = self._calculate_oi_delta_1h(window)
+        z_oi_delta_1h = None
+
+        if oi_delta_1h is not None:
+            window.oi_deltas.append(oi_delta_1h)
+
+            # Calculate z-score if sufficient history (60+ deltas)
+            if len(window.oi_deltas) >= 60:
+                z_oi_delta_1h = self._robust_zscore(list(window.oi_deltas))
+            else:
+                z_oi_delta_1h = 0.0  # Not enough history yet
+        else:
+            window.oi_deltas.append(None)  # Maintain alignment
 
         # Liquidation sum over last 15 bars
         liq_15m = sum(list(window.liq_notionals)[-15:]) if len(window.liq_notionals) >= 15 else 0
@@ -243,7 +377,7 @@ class FeatureCalculator:
         close_now = closes[-1]
         close_past = closes[-(lookback + 1)]
 
-        if close_past <= 0:
+        if close_past <= 0 or close_now <= 0:
             return 0.0
 
         return np.log(close_now / close_past)
@@ -258,7 +392,7 @@ class FeatureCalculator:
         close_now = closes_list[index]
         close_past = closes_list[index - lookback]
 
-        if close_past <= 0:
+        if close_past <= 0 or close_now <= 0:
             return 0.0
 
         return np.log(close_now / close_past)
@@ -307,8 +441,16 @@ class FeatureCalculator:
                 break
 
             # 5m return = ln(close_end / close_start)
-            symbol_ret = np.log(closes_list[idx_end - 1] / closes_list[idx_start - 1]) if closes_list[idx_start - 1] > 0 else 0
-            btc_ret = np.log(btc_closes_list[idx_end - 1] / btc_closes_list[idx_start - 1]) if btc_closes_list[idx_start - 1] > 0 else 0
+            # Check denominator before division to avoid divide by zero warnings
+            if closes_list[idx_start - 1] > 0 and closes_list[idx_end - 1] > 0:
+                symbol_ret = np.log(closes_list[idx_end - 1] / closes_list[idx_start - 1])
+            else:
+                symbol_ret = 0.0
+
+            if btc_closes_list[idx_start - 1] > 0 and btc_closes_list[idx_end - 1] > 0:
+                btc_ret = np.log(btc_closes_list[idx_end - 1] / btc_closes_list[idx_start - 1])
+            else:
+                btc_ret = 0.0
 
             symbol_5m_returns.append(symbol_ret)
             btc_5m_returns.append(btc_ret)
@@ -363,7 +505,16 @@ class FeatureCalculator:
         if len(series) < 10:
             return 0.0
 
-        arr = np.array(series)
+        # Filter out None and NaN values
+        filtered = [x for x in series if x is not None and not np.isnan(x)]
+
+        if len(filtered) < 10:
+            return 0.0
+
+        # Get the last valid value
+        last_value = filtered[-1]
+
+        arr = np.array(filtered)
         median = np.median(arr)
         mad = np.median(np.abs(arr - median))
 
@@ -372,7 +523,7 @@ class FeatureCalculator:
         if robust_sigma < 1e-9:
             return 0.0
 
-        z = (arr[-1] - median) / robust_sigma
+        z = (last_value - median) / robust_sigma
         return z
 
     def _calculate_taker_share(self, window: RollingWindow, lookback: int = 15) -> Optional[float]:
@@ -392,3 +543,111 @@ class FeatureCalculator:
             return None
 
         return total_buy / total
+
+    def _calculate_taker_share_at_index(self, window: RollingWindow, index: int, lookback: int = 15) -> Optional[float]:
+        """Calculate taker buy share at a specific index for backfill."""
+        if index < lookback - 1 or len(window.taker_buys) <= index or len(window.taker_sells) <= index:
+            return None
+
+        taker_buys_list = list(window.taker_buys)
+        taker_sells_list = list(window.taker_sells)
+
+        start_idx = max(0, index - lookback + 1)
+        end_idx = index + 1
+
+        total_buy = sum(taker_buys_list[start_idx:end_idx])
+        total_sell = sum(taker_sells_list[start_idx:end_idx])
+
+        total = total_buy + total_sell
+
+        if total == 0:
+            return None
+
+        return total_buy / total
+
+    def _calculate_beta_at_index_extended(self, symbol: str, index: int, extended_windows: dict) -> float:
+        """
+        Calculate beta at a specific historical index using extended windows.
+
+        For backfill, we use a simplified approach: calculate beta from all available data up to this point.
+        This is an approximation but sufficient for initializing historical z-scores.
+        """
+        if symbol == self.config.universe.benchmark_symbol:
+            return 1.0  # BTC has beta of 1 vs itself
+
+        window = extended_windows.get(symbol)
+        btc_window = extended_windows.get(self.config.universe.benchmark_symbol)
+
+        if not window or not btc_window:
+            return 0.0
+
+        # Use simplified beta: calculate from available data up to current index
+        # For simplicity, use the last 240 bars (or all available if less)
+        lookback = min(240, index + 1)
+
+        if lookback < 2:
+            return 0.0
+
+        closes_list = list(window.closes)[:index + 1]
+        btc_closes_list = list(btc_window.closes)[:index + 1]
+
+        if len(closes_list) < lookback or len(btc_closes_list) < lookback:
+            return 0.0
+
+        # Calculate log returns for the lookback period
+        symbol_returns = []
+        btc_returns = []
+
+        for i in range(-lookback + 1, 0):
+            if closes_list[i - 1] > 0 and btc_closes_list[i - 1] > 0:
+                symbol_ret = math.log(closes_list[i] / closes_list[i - 1])
+                btc_ret = math.log(btc_closes_list[i] / btc_closes_list[i - 1])
+                symbol_returns.append(symbol_ret)
+                btc_returns.append(btc_ret)
+
+        if len(symbol_returns) < 2:
+            return 0.0
+
+        # Simple OLS regression: beta = cov(symbol, btc) / var(btc)
+        import statistics
+
+        if len(btc_returns) < 2:
+            return 0.0
+
+        try:
+            btc_var = statistics.variance(btc_returns)
+            if btc_var < 1e-10:
+                return 0.0
+
+            btc_mean = statistics.mean(btc_returns)
+            symbol_mean = statistics.mean(symbol_returns)
+
+            cov = sum((btc_returns[i] - btc_mean) * (symbol_returns[i] - symbol_mean) for i in range(len(btc_returns))) / len(btc_returns)
+
+            beta = cov / btc_var
+            return beta
+
+        except Exception:
+            return 0.0
+
+    def _calculate_oi_delta_1h(self, window: RollingWindow) -> Optional[float]:
+        """
+        Calculate OI delta over last 1 hour (60 bars).
+
+        Returns:
+            OI delta (current OI - OI from 60 bars ago), or None if insufficient data
+        """
+        if len(window.ois) < 61:  # Need at least 61 bars (current + 60 back)
+            return None
+
+        # Get current and 1h ago OI values
+        oi_current = window.ois[-1]
+        oi_1h_ago = window.ois[-61]  # 60 bars back (index -61 because -1 is current)
+
+        # Check if both values are available
+        if oi_current is None or oi_1h_ago is None:
+            return None
+
+        # Calculate delta
+        delta = oi_current - oi_1h_ago
+        return delta

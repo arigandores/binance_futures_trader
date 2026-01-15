@@ -5,7 +5,7 @@ import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
-from detector.models import Bar, Features, Event, Direction
+from detector.models import Bar, Features, Event, Direction, Position, PositionStatus, ExitReason
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,10 @@ class Storage:
 
         # Create tables
         await self._create_tables()
+
+        # Run migration to add oi column (for existing databases)
+        await self._migrate_add_oi_column()
+
         await self.db.commit()
 
         logger.info(f"Database initialized at {self.db_path} (WAL mode: {self.wal_mode})")
@@ -53,6 +57,7 @@ class Storage:
                 liq_notional REAL, liq_count INTEGER,
                 mid REAL, spread_bps REAL,
                 mark REAL, funding REAL, next_funding_ts INTEGER,
+                oi REAL,
                 PRIMARY KEY (symbol, ts_minute)
             )
         """)
@@ -94,10 +99,66 @@ class Storage:
             )
         """)
 
+        # Table: positions
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                position_id TEXT PRIMARY KEY,
+                event_id TEXT,
+                symbol TEXT,
+                direction TEXT,
+                status TEXT,
+
+                open_price REAL,
+                open_ts INTEGER,
+                entry_z_er REAL,
+                entry_z_vol REAL,
+                entry_taker_share REAL,
+
+                close_price REAL,
+                close_ts INTEGER,
+                exit_z_er REAL,
+                exit_z_vol REAL,
+                exit_reason TEXT,
+
+                pnl_percent REAL,
+                pnl_ticks REAL,
+                max_favorable_excursion REAL,
+                max_adverse_excursion REAL,
+
+                duration_minutes INTEGER,
+                bars_held INTEGER,
+                metrics_json TEXT,
+
+                FOREIGN KEY (event_id) REFERENCES events(event_id)
+            )
+        """)
+
         # Create indices
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_bars_ts ON bars_1m(ts_minute DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_features_ts ON features(ts_minute DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_positions_open_ts ON positions(open_ts DESC)")
+
+    async def _migrate_add_oi_column(self) -> None:
+        """Add oi column to bars_1m if it doesn't exist (migration for existing databases)."""
+        try:
+            # Check if column exists
+            async with self.db.execute("PRAGMA table_info(bars_1m)") as cursor:
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'oi' not in column_names:
+                    logger.info("Migrating database: adding 'oi' column to bars_1m")
+                    await self.db.execute("ALTER TABLE bars_1m ADD COLUMN oi REAL")
+                    await self.db.commit()
+                    logger.info("Migration complete: oi column added")
+                else:
+                    logger.debug("Migration skipped: oi column already exists")
+        except Exception as e:
+            logger.error(f"Error during OI column migration: {e}")
+            # Non-fatal - continue without OI if migration fails
 
     async def batch_write_bars(self, bars: List[Bar]) -> None:
         """Add bars to buffer (will be flushed periodically)."""
@@ -150,7 +211,8 @@ class Storage:
                 bar.taker_buy, bar.taker_sell,
                 bar.liq_notional, bar.liq_count,
                 bar.mid, bar.spread_bps,
-                bar.mark, bar.funding, bar.next_funding_ts
+                bar.mark, bar.funding, bar.next_funding_ts,
+                bar.oi
             )
             for bar in self.bars_buffer
         ]
@@ -163,8 +225,9 @@ class Storage:
                 taker_buy, taker_sell,
                 liq_notional, liq_count,
                 mid, spread_bps,
-                mark, funding, next_funding_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mark, funding, next_funding_ts,
+                oi
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, bars_data)
 
         self.bars_buffer.clear()
@@ -237,7 +300,7 @@ class Storage:
             async with self.db.execute("""
                 SELECT symbol, ts_minute, o, h, l, c, vol, notional, trades,
                        taker_buy, taker_sell, liq_notional, liq_count,
-                       mid, spread_bps, mark, funding, next_funding_ts
+                       mid, spread_bps, mark, funding, next_funding_ts, oi
                 FROM bars_1m
                 WHERE symbol = ?
                 ORDER BY ts_minute DESC
@@ -266,7 +329,8 @@ class Storage:
                     spread_bps=row[14],
                     mark=row[15],
                     funding=row[16],
-                    next_funding_ts=row[17]
+                    next_funding_ts=row[17],
+                    oi=row[18]
                 )
                 bars.append(bar)
 
@@ -392,6 +456,162 @@ class Storage:
         except Exception as e:
             logger.error(f"Error clearing database: {e}")
             await self.db.rollback()
+
+    async def write_position(self, position: Position) -> None:
+        """Write or update position in database."""
+        if not self.db:
+            logger.warning("Database not initialized, skipping position write")
+            return
+
+        try:
+            await self.db.execute("""
+                INSERT OR REPLACE INTO positions (
+                    position_id, event_id, symbol, direction, status,
+                    open_price, open_ts, entry_z_er, entry_z_vol, entry_taker_share,
+                    close_price, close_ts, exit_z_er, exit_z_vol, exit_reason,
+                    pnl_percent, pnl_ticks, max_favorable_excursion, max_adverse_excursion,
+                    duration_minutes, bars_held, metrics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                position.position_id,
+                position.event_id,
+                position.symbol,
+                position.direction.value,
+                position.status.value,
+                position.open_price,
+                position.open_ts,
+                position.entry_z_er,
+                position.entry_z_vol,
+                position.entry_taker_share,
+                position.close_price,
+                position.close_ts,
+                position.exit_z_er,
+                position.exit_z_vol,
+                position.exit_reason.value if position.exit_reason else None,
+                position.pnl_percent,
+                position.pnl_ticks,
+                position.max_favorable_excursion,
+                position.max_adverse_excursion,
+                position.duration_minutes,
+                position.bars_held,
+                json.dumps(position.metrics)
+            ))
+            await self.db.commit()
+            logger.debug(f"Position {position.position_id} written to DB")
+        except Exception as e:
+            logger.error(f"Error writing position to DB: {e}")
+
+    async def get_open_positions(self, symbol: Optional[str] = None) -> List[Position]:
+        """Get all open positions, optionally filtered by symbol."""
+        if not self.db:
+            logger.warning("Database not initialized")
+            return []
+
+        try:
+            if symbol:
+                query = "SELECT * FROM positions WHERE status = ? AND symbol = ?"
+                params = (PositionStatus.OPEN.value, symbol)
+            else:
+                query = "SELECT * FROM positions WHERE status = ?"
+                params = (PositionStatus.OPEN.value,)
+
+            async with self.db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+
+            return [self._row_to_position(row) for row in rows]
+
+        except Exception as e:
+            logger.error(f"Error fetching open positions: {e}")
+            return []
+
+    async def get_position_by_id(self, position_id: str) -> Optional[Position]:
+        """Get position by ID."""
+        if not self.db:
+            logger.warning("Database not initialized")
+            return None
+
+        try:
+            async with self.db.execute(
+                "SELECT * FROM positions WHERE position_id = ?",
+                (position_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row:
+                return self._row_to_position(row)
+            return None
+
+        except Exception as e:
+            logger.error(f"Error fetching position {position_id}: {e}")
+            return None
+
+    async def query_positions(
+        self,
+        status: Optional[PositionStatus] = None,
+        symbol: Optional[str] = None,
+        since_ts: Optional[int] = None,
+        limit: int = 1000
+    ) -> List[Position]:
+        """Query positions with filters."""
+        if not self.db:
+            return []
+
+        try:
+            query_parts = ["SELECT * FROM positions WHERE 1=1"]
+            params = []
+
+            if status:
+                query_parts.append("AND status = ?")
+                params.append(status.value)
+
+            if symbol:
+                query_parts.append("AND symbol = ?")
+                params.append(symbol)
+
+            if since_ts:
+                query_parts.append("AND open_ts >= ?")
+                params.append(since_ts)
+
+            query_parts.append("ORDER BY open_ts DESC LIMIT ?")
+            params.append(limit)
+
+            query = " ".join(query_parts)
+
+            async with self.db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+
+            return [self._row_to_position(row) for row in rows]
+
+        except Exception as e:
+            logger.error(f"Error querying positions: {e}")
+            return []
+
+    def _row_to_position(self, row: Tuple) -> Position:
+        """Convert database row to Position object."""
+        return Position(
+            position_id=row[0],
+            event_id=row[1],
+            symbol=row[2],
+            direction=Direction(row[3]),
+            status=PositionStatus(row[4]),
+            open_price=row[5],
+            open_ts=row[6],
+            entry_z_er=row[7],
+            entry_z_vol=row[8],
+            entry_taker_share=row[9],
+            close_price=row[10],
+            close_ts=row[11],
+            exit_z_er=row[12],
+            exit_z_vol=row[13],
+            exit_reason=ExitReason(row[14]) if row[14] else None,
+            pnl_percent=row[15],
+            pnl_ticks=row[16],
+            max_favorable_excursion=row[17] or 0.0,
+            max_adverse_excursion=row[18] or 0.0,
+            duration_minutes=row[19],
+            bars_held=row[20],
+            metrics=json.loads(row[21]) if row[21] else {}
+        )
 
     async def close(self) -> None:
         """Close database connection."""

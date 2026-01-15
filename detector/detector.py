@@ -29,10 +29,12 @@ class AnomalyDetector:
         event_queue: asyncio.Queue,
         rest_client: BinanceRestClient,
         storage: Storage,
-        config: Config
+        config: Config,
+        extra_event_queues: list = None
     ):
         self.feature_queue = feature_queue
         self.event_queue = event_queue
+        self.extra_event_queues = extra_event_queues or []
         self.rest_client = rest_client
         self.storage = storage
         self.config = config
@@ -87,6 +89,13 @@ class AnomalyDetector:
 
             # Emit initiator alert
             await self.event_queue.put(('initiator', event))
+
+            # Broadcast to extra queues (e.g. position manager)
+            for queue in self.extra_event_queues:
+                try:
+                    await queue.put(('initiator', event))
+                except Exception as e:
+                    logger.error(f"Error broadcasting event to extra queue: {e}")
 
             # Write to database
             await self.storage.write_event(event)
@@ -272,6 +281,14 @@ class AnomalyDetector:
                         )
 
                         await self.event_queue.put(('sector', sector_event))
+
+                        # Broadcast to extra queues
+                        for queue in self.extra_event_queues:
+                            try:
+                                await queue.put(('sector', sector_event))
+                            except Exception as e:
+                                logger.error(f"Error broadcasting sector event: {e}")
+
                         await self.storage.write_event(sector_event)
 
                         logger.info(f"Sector diffusion detected: {initiator_symbol} in sector '{initiator_sector.name}' with {follower_count} followers")

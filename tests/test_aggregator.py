@@ -12,7 +12,13 @@ async def test_agg_trade_bar_aggregation():
     tick_queue = asyncio.Queue()
     bar_queue = asyncio.Queue()
 
-    aggregator = BarAggregator(tick_queue, bar_queue, clock_tolerance_sec=2)
+    aggregator = BarAggregator(
+        tick_queue=tick_queue,
+        bar_queue=bar_queue,
+        symbols=["BTCUSDT"],
+        rest_client=None,
+        clock_tolerance_sec=2
+    )
 
     # Simulate aggTrade ticks for BTCUSDT
     trades = [
