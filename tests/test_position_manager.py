@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 from detector.position_manager import PositionManager
 from detector.models import (
     Event, Features, Bar, Position, PositionStatus, ExitReason,
-    Direction, EventStatus
+    Direction
 )
 from detector.storage import Storage
 from detector.config import Config
@@ -71,8 +71,6 @@ def create_event(symbol="BTCUSDT", direction=Direction.UP, ts=1000000000):
         ts=ts,
         initiator_symbol=symbol,
         direction=direction,
-        status=EventStatus.CONFIRMED,
-        followers=[],
         metrics={
             'z_er': 3.5,
             'z_vol': 3.2,
@@ -500,7 +498,8 @@ async def test_telegram_notification_on_position_close(position_manager, mock_st
     payload = call_args[1]['json']
     assert "POSITION CLOSED" in payload['text']
     assert "WIN" in payload['text']  # Should be profit
-    assert "TAKE_PROFIT" in payload['text']
+    # Changed to Russian: "Тейк-профит" instead of "TAKE_PROFIT"
+    assert "Тейк-профит" in payload['text'] or "TAKE_PROFIT" in payload['text']
     assert "PnL:" in payload['text']
 
 

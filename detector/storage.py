@@ -84,8 +84,6 @@ class Storage:
                 ts INTEGER,
                 initiator_symbol TEXT,
                 direction TEXT,
-                status TEXT,
-                followers_json TEXT,
                 metrics_json TEXT
             )
         """)
@@ -133,6 +131,19 @@ class Storage:
             )
         """)
 
+        # Table: alert_audit - для аудита всех алертов
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS alert_audit (
+                alert_id TEXT PRIMARY KEY,
+                ts INTEGER,
+                alert_type TEXT,
+                symbol TEXT,
+                direction TEXT,
+                message_text TEXT,
+                metadata_json TEXT
+            )
+        """)
+
         # Create indices
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_bars_ts ON bars_1m(ts_minute DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_features_ts ON features(ts_minute DESC)")
@@ -140,6 +151,9 @@ class Storage:
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_positions_open_ts ON positions(open_ts DESC)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_alert_audit_ts ON alert_audit(ts DESC)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_alert_audit_type ON alert_audit(alert_type)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_alert_audit_symbol ON alert_audit(symbol)")
 
     async def _migrate_add_oi_column(self) -> None:
         """Add oi column to bars_1m if it doesn't exist (migration for existing databases)."""
@@ -273,16 +287,13 @@ class Storage:
         try:
             await self.db.execute("""
                 INSERT INTO events (
-                    event_id, ts, initiator_symbol, direction, status,
-                    followers_json, metrics_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    event_id, ts, initiator_symbol, direction, metrics_json
+                ) VALUES (?, ?, ?, ?, ?)
             """, (
                 event.event_id,
                 event.ts,
                 event.initiator_symbol,
                 event.direction.value,
-                event.status.value,
-                json.dumps(event.followers),
                 json.dumps(event.metrics)
             ))
             await self.db.commit()
@@ -402,8 +413,7 @@ class Storage:
         try:
             if since_ts is not None:
                 query = """
-                    SELECT event_id, ts, initiator_symbol, direction, status,
-                           followers_json, metrics_json
+                    SELECT event_id, ts, initiator_symbol, direction, metrics_json
                     FROM events
                     WHERE ts >= ?
                     ORDER BY ts DESC
@@ -412,8 +422,7 @@ class Storage:
                 params = (since_ts, limit)
             else:
                 query = """
-                    SELECT event_id, ts, initiator_symbol, direction, status,
-                           followers_json, metrics_json
+                    SELECT event_id, ts, initiator_symbol, direction, metrics_json
                     FROM events
                     ORDER BY ts DESC
                     LIMIT ?
@@ -430,9 +439,7 @@ class Storage:
                     ts=row[1],
                     initiator_symbol=row[2],
                     direction=Direction(row[3]),
-                    status=row[4],
-                    followers=json.loads(row[5]) if row[5] else [],
-                    metrics=json.loads(row[6]) if row[6] else {}
+                    metrics=json.loads(row[4]) if row[4] else {}
                 )
                 events.append(event)
 
@@ -612,6 +619,116 @@ class Storage:
             bars_held=row[20],
             metrics=json.loads(row[21]) if row[21] else {}
         )
+
+    async def write_alert(
+        self,
+        alert_id: str,
+        ts: int,
+        alert_type: str,
+        symbol: str,
+        direction: str,
+        message_text: str,
+        metadata: Optional[dict] = None
+    ) -> None:
+        """
+        Write alert to audit table for future analysis.
+
+        Args:
+            alert_id: Unique alert identifier
+            ts: Timestamp in milliseconds
+            alert_type: Type of alert (PENDING_SIGNAL_CREATED, POSITION_OPENED, etc.)
+            symbol: Trading symbol
+            direction: UP or DOWN
+            message_text: Full formatted alert message
+            metadata: Additional metrics as dict
+        """
+        if not self.db:
+            logger.warning("Database not initialized, skipping alert write")
+            return
+
+        try:
+            await self.db.execute("""
+                INSERT OR REPLACE INTO alert_audit (
+                    alert_id, ts, alert_type, symbol, direction, message_text, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                alert_id,
+                ts,
+                alert_type,
+                symbol,
+                direction,
+                message_text,
+                json.dumps(metadata) if metadata else None
+            ))
+            await self.db.commit()
+            logger.debug(f"Alert {alert_type} for {symbol} written to audit log")
+        except Exception as e:
+            logger.error(f"Error writing alert to audit log: {e}")
+
+    async def query_alerts(
+        self,
+        alert_type: Optional[str] = None,
+        symbol: Optional[str] = None,
+        since_ts: Optional[int] = None,
+        limit: int = 1000
+    ) -> List[dict]:
+        """
+        Query alerts from audit table.
+
+        Args:
+            alert_type: Filter by alert type
+            symbol: Filter by symbol
+            since_ts: Filter alerts after this timestamp
+            limit: Maximum number of alerts to return
+
+        Returns:
+            List of alert dictionaries
+        """
+        if not self.db:
+            return []
+
+        try:
+            query_parts = ["SELECT * FROM alert_audit WHERE 1=1"]
+            params = []
+
+            if alert_type:
+                query_parts.append("AND alert_type = ?")
+                params.append(alert_type)
+
+            if symbol:
+                query_parts.append("AND symbol = ?")
+                params.append(symbol)
+
+            if since_ts:
+                query_parts.append("AND ts >= ?")
+                params.append(since_ts)
+
+            query_parts.append("ORDER BY ts DESC LIMIT ?")
+            params.append(limit)
+
+            query = " ".join(query_parts)
+
+            async with self.db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+
+            alerts = []
+            for row in rows:
+                alert = {
+                    'alert_id': row[0],
+                    'ts': row[1],
+                    'alert_type': row[2],
+                    'symbol': row[3],
+                    'direction': row[4],
+                    'message_text': row[5],
+                    'metadata': json.loads(row[6]) if row[6] else {}
+                }
+                alerts.append(alert)
+
+            return alerts
+
+        except Exception as e:
+            logger.error(f"Error querying alerts: {e}")
+            return []
 
     async def close(self) -> None:
         """Close database connection."""

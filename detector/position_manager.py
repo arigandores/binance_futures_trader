@@ -21,7 +21,7 @@ def format_price(price: float) -> str:
     else:
         return f"${price:,.8f}"
 from detector.models import (
-    Event, Features, Bar, Position, PositionStatus, ExitReason, Direction, EventStatus,
+    Event, Features, Bar, Position, PositionStatus, ExitReason, Direction,
     PendingSignal
 )
 from detector.storage import Storage
@@ -36,7 +36,7 @@ class PositionManager:
     Manages virtual trading positions.
 
     Responsibilities:
-    - Opens positions on initiator alerts (CONFIRMED or UNCONFIRMED)
+    - Opens positions on initiator alerts
     - Monitors open positions and updates MFE/MAE
     - Closes positions based on exit conditions:
         * Z-Score Reversal (z_er < threshold)
@@ -357,10 +357,22 @@ class PositionManager:
             f"(will enter AS SOON AS triggers met)"
         )
 
-        # Send Telegram notification
-        if self.config.alerts.telegram.enabled:
-            message = self._format_pending_signal_created(pending, event)
-            await self._send_telegram(message)
+        # Send Telegram notification and save to audit log
+        message = self._format_pending_signal_created(pending, event)
+        await self._send_and_save_alert(
+            alert_type="PENDING_SIGNAL_CREATED",
+            symbol=pending.symbol,
+            direction=pending.direction.value,
+            message=message,
+            alert_id=f"pending_created_{pending.signal_id}",
+            ts=pending.created_ts,
+            metadata={
+                'signal_z_er': pending.signal_z_er,
+                'signal_z_vol': pending.signal_z_vol,
+                'signal_price': pending.signal_price,
+                'event_id': event.event_id
+            }
+        )
 
     async def _check_pending_signals(self, symbol: str, bar: Bar) -> None:
         """
@@ -396,10 +408,23 @@ class PositionManager:
                             f"Reason: {pending.invalidation_reason} | "
                             f"Duration: {pending.bars_since_signal} bars"
                         )
-                        # Send Telegram notification
-                        if self.config.alerts.telegram.enabled:
-                            message = self._format_pending_signal_invalidated(pending)
-                            await self._send_telegram(message)
+                        # Send Telegram notification and save to audit log
+                        message = self._format_pending_signal_invalidated(pending)
+                        await self._send_and_save_alert(
+                            alert_type="PENDING_SIGNAL_INVALIDATED",
+                            symbol=pending.symbol,
+                            direction=pending.direction.value,
+                            message=message,
+                            alert_id=f"pending_invalidated_{pending.signal_id}_{bar.ts_minute}",
+                            ts=bar.ts_minute,
+                            metadata={
+                                'invalidation_reason': pending.invalidation_reason,
+                                'invalidation_details': pending.invalidation_details,
+                                'bars_since_signal': pending.bars_since_signal,
+                                'signal_z_er': pending.signal_z_er,
+                                'signal_price': pending.signal_price
+                            }
+                        )
                     continue  # Skip to next pending
 
                 # Must-Fix #10: Only increment bars_since_signal ONCE per bar (idempotent)
@@ -421,10 +446,22 @@ class PositionManager:
                             f"Pending signal expired: {signal_id} "
                             f"(triggers not met within {cfg.entry_trigger_max_wait_minutes}m)"
                         )
-                        # Send Telegram notification
-                        if self.config.alerts.telegram.enabled:
-                            message = self._format_pending_signal_expired(pending, cfg.entry_trigger_max_wait_minutes)
-                            await self._send_telegram(message)
+                        # Send Telegram notification and save to audit log
+                        message = self._format_pending_signal_expired(pending, cfg.entry_trigger_max_wait_minutes)
+                        await self._send_and_save_alert(
+                            alert_type="PENDING_SIGNAL_EXPIRED",
+                            symbol=pending.symbol,
+                            direction=pending.direction.value,
+                            message=message,
+                            alert_id=f"pending_expired_{pending.signal_id}_{bar.ts_minute}",
+                            ts=bar.ts_minute,
+                            metadata={
+                                'max_wait_minutes': cfg.entry_trigger_max_wait_minutes,
+                                'bars_since_signal': pending.bars_since_signal,
+                                'signal_z_er': pending.signal_z_er,
+                                'signal_price': pending.signal_price
+                            }
+                        )
                     continue
 
                 # Check min_wait_bars (optional filter to avoid same-bar entry)
@@ -515,16 +552,24 @@ class PositionManager:
             if current_features.z_er_15m <= 0:
                 # Signal reversed to bearish - invalidate
                 pending.invalidated = True
-                pending.invalidation_reason = f"Direction reversed (z_ER: {current_features.z_er_15m:.2f})"
-                logger.info(f"{symbol}: {pending.invalidation_reason}")
+                pending.invalidation_reason = "direction_flip"
+                pending.invalidation_details = (
+                    f"Направление развернулось: сигнал был UP, но z_ER стал {current_features.z_er_15m:.2f}σ (≤ 0). "
+                    f"Рынок перешёл в медвежью фазу."
+                )
+                logger.info(f"{symbol}: {pending.invalidation_reason} - {pending.invalidation_details}")
                 return False  # Signal no longer valid
             current_z_er = current_features.z_er_15m  # No abs() for UP
         else:  # DOWN
             if current_features.z_er_15m >= 0:
                 # Signal reversed to bullish - invalidate
                 pending.invalidated = True
-                pending.invalidation_reason = f"Direction reversed (z_ER: {current_features.z_er_15m:.2f})"
-                logger.info(f"{symbol}: {pending.invalidation_reason}")
+                pending.invalidation_reason = "direction_flip"
+                pending.invalidation_details = (
+                    f"Направление развернулось: сигнал был DOWN, но z_ER стал +{current_features.z_er_15m:.2f}σ (≥ 0). "
+                    f"Рынок перешёл в бычью фазу."
+                )
+                logger.info(f"{symbol}: {pending.invalidation_reason} - {pending.invalidation_details}")
                 return False  # Signal no longer valid
             current_z_er = abs(current_features.z_er_15m)  # Use abs for comparison
 
@@ -677,9 +722,6 @@ class PositionManager:
         position_id = f"{symbol}_{bar.ts_minute}_{event.direction.value}_triggered"
         metrics = event.metrics.copy()
 
-        # Store event status
-        metrics['event_status'] = event.status.value
-
         # Store signal → entry timing
         metrics['signal_ts'] = pending.created_ts
         metrics['entry_ts'] = bar.ts_minute
@@ -694,6 +736,9 @@ class PositionManager:
                 'risk_reward_ratio': targets['risk_reward_ratio']
             })
 
+        # Generate detailed entry explanation
+        entry_details = self._generate_entry_reason_details(pending, bar)
+
         position = Position(
             position_id=position_id,
             event_id=event.event_id,
@@ -705,6 +750,7 @@ class PositionManager:
             entry_z_er=metrics.get('z_er', 0),
             entry_z_vol=metrics.get('z_vol', 0),
             entry_taker_share=metrics.get('taker_share', 0),
+            entry_reason_details=entry_details,
             metrics=metrics
         )
 
@@ -718,10 +764,80 @@ class PositionManager:
             f"Trigger delay: {metrics['trigger_delay_bars']} bars (~{metrics['trigger_delay_seconds_approx']}s)"
         )
 
-        # Send Telegram notification
-        if self.config.alerts.telegram.enabled:
-            message = self._format_position_opened_from_pending(position)
-            await self._send_telegram(message)
+        # Send Telegram notification and save to audit log
+        message = self._format_position_opened_from_pending(position)
+        await self._send_and_save_alert(
+            alert_type="POSITION_OPENED",
+            symbol=position.symbol,
+            direction=position.direction.value,
+            message=message,
+            alert_id=f"position_opened_{position.position_id}",
+            ts=position.open_ts,
+            metadata={
+                'position_id': position.position_id,
+                'open_price': position.open_price,
+                'entry_z_er': position.entry_z_er,
+                'entry_z_vol': position.entry_z_vol,
+                'trigger_delay_bars': metrics.get('trigger_delay_bars', 0),
+                'entry_reason_details': entry_details,
+                'from_pending': True
+            }
+        )
+
+    def _generate_entry_reason_details(self, pending: PendingSignal, bar: Bar) -> str:
+        """Generate human-readable detailed explanation for position entry."""
+        cfg = self.config.position_management
+        symbol = pending.symbol
+        direction = "LONG" if pending.direction == Direction.UP else "SHORT"
+
+        # Calculate pullback from peak
+        pullback_pct = 0.0
+        if pending.peak_since_signal:
+            if pending.direction == Direction.UP:
+                pullback_pct = (pending.peak_since_signal - bar.close) / pending.peak_since_signal * 100
+            else:
+                pullback_pct = (bar.close - pending.peak_since_signal) / pending.peak_since_signal * 100
+
+        # Get taker share
+        taker_share = bar.taker_buy_share()
+        dominance_pct = taker_share * 100 if taker_share else 0
+        if pending.direction == Direction.DOWN:
+            dominance_pct = 100 - dominance_pct  # Sell dominance for SHORT
+
+        # Build entry explanation
+        details_parts = []
+
+        # 1. Signal detection
+        details_parts.append(
+            f"Сигнал: z_ER = {pending.signal_z_er:.2f}σ при цене {format_price(pending.signal_price)}"
+        )
+
+        # 2. Z-score cooldown
+        details_parts.append(
+            f"Z-score остыл: диапазон [{cfg.entry_trigger_z_cooldown:.1f}, 3.0]σ ✓"
+        )
+
+        # 3. Pullback
+        details_parts.append(
+            f"Откат: {pullback_pct:.2f}% от пика {format_price(pending.peak_since_signal)} "
+            f"(требуется: ≥{cfg.entry_trigger_pullback_pct:.1f}%) ✓"
+        )
+
+        # 4. Flow dominance
+        flow_type = "Buy" if pending.direction == Direction.UP else "Sell"
+        details_parts.append(
+            f"{flow_type}-доминирование: {dominance_pct:.1f}% "
+            f"(требуется: ≥{cfg.entry_trigger_min_taker_dominance * 100:.0f}%) ✓"
+        )
+
+        # 5. Wait time
+        wait_bars = pending.bars_since_signal
+        wait_seconds = (bar.ts_minute - pending.created_ts) // 1000
+        details_parts.append(
+            f"Ожидание: {wait_bars} баров (~{wait_seconds}s)"
+        )
+
+        return " | ".join(details_parts)
 
     async def _cleanup_expired_pending_signals(self) -> None:
         """
@@ -752,10 +868,22 @@ class PositionManager:
                             f"(TTL: {self.config.position_management.entry_trigger_max_wait_minutes}m, "
                             f"bars evaluated: {pending.bars_since_signal})"
                         )
-                        # Send Telegram notification
-                        if self.config.alerts.telegram.enabled:
-                            message = self._format_pending_signal_expired(pending, self.config.position_management.entry_trigger_max_wait_minutes)
-                            await self._send_telegram(message)
+                        # Send Telegram notification and save to audit log
+                        message = self._format_pending_signal_expired(pending, self.config.position_management.entry_trigger_max_wait_minutes)
+                        await self._send_and_save_alert(
+                            alert_type="PENDING_SIGNAL_EXPIRED",
+                            symbol=pending.symbol,
+                            direction=pending.direction.value,
+                            message=message,
+                            alert_id=f"pending_expired_cleanup_{pending.signal_id}_{max_bar_ts}",
+                            ts=max_bar_ts,
+                            metadata={
+                                'max_wait_minutes': self.config.position_management.entry_trigger_max_wait_minutes,
+                                'bars_since_signal': pending.bars_since_signal,
+                                'signal_z_er': pending.signal_z_er,
+                                'signal_price': pending.signal_price
+                            }
+                        )
 
     async def _open_position(self, event: Event) -> None:
         """
@@ -803,9 +931,6 @@ class PositionManager:
         position_id = f"{symbol}_{event.ts}_{event.direction.value}"
         metrics = event.metrics.copy()
 
-        # Store event status for Telegram notifications
-        metrics['event_status'] = event.status.value
-
         # Store dynamic targets in metrics for later use
         if targets:
             metrics.update({
@@ -834,13 +959,26 @@ class PositionManager:
 
         logger.info(
             f"Position opened: {position_id} | {symbol} {event.direction.value} "
-            f"@ {bar.close:.2f} | Status: {event.status.value}"
+            f"@ {bar.close:.2f}"
         )
 
-        # Send Telegram notification
-        if self.config.alerts.telegram.enabled:
-            message = self._format_position_opened(position)
-            await self._send_telegram(message)
+        # Send Telegram notification and save to audit log
+        message = self._format_position_opened(position)
+        await self._send_and_save_alert(
+            alert_type="POSITION_OPENED",
+            symbol=position.symbol,
+            direction=position.direction.value,
+            message=message,
+            alert_id=f"position_opened_{position.position_id}",
+            ts=position.open_ts,
+            metadata={
+                'position_id': position.position_id,
+                'open_price': position.open_price,
+                'entry_z_er': position.entry_z_er,
+                'entry_z_vol': position.entry_z_vol,
+                'from_pending': False
+            }
+        )
 
     async def _update_excursions(self, bar: Bar) -> None:
         """Update MFE/MAE for open positions in this symbol."""
@@ -1312,16 +1450,26 @@ class PositionManager:
         z_er = features.z_er_15m if features.z_er_15m is not None else 0.0
 
         if direction == Direction.UP and z_er < 0:
+            details = (
+                f"Направление развернулось: сигнал был UP, но z_ER стал {z_er:.2f}σ (< 0). "
+                f"Рынок перешёл в медвежью фазу."
+            )
             logger.debug(
                 f"{symbol}: Invalidation TRIGGERED (priority 1) - direction flip "
                 f"(was UP, z_ER now {z_er:.2f} < 0)"
             )
+            pending.invalidation_details = details
             return "direction_flip"
         elif direction == Direction.DOWN and z_er > 0:
+            details = (
+                f"Направление развернулось: сигнал был DOWN, но z_ER стал +{z_er:.2f}σ (> 0). "
+                f"Рынок перешёл в бычью фазу."
+            )
             logger.debug(
                 f"{symbol}: Invalidation TRIGGERED (priority 1) - direction flip "
                 f"(was DOWN, z_ER now {z_er:.2f} > 0)"
             )
+            pending.invalidation_details = details
             return "direction_flip"
 
         logger.debug(
@@ -1336,10 +1484,16 @@ class PositionManager:
         abs_z_er = abs(z_er)
 
         if abs_z_er < profile.invalidate_z_er_min:
+            details = (
+                f"Импульс угас: |z_ER| = {abs_z_er:.2f}σ (было {pending.signal_z_er:.2f}σ). "
+                f"Минимальный порог: {profile.invalidate_z_er_min}σ. "
+                f"Сигнал потерял силу."
+            )
             logger.debug(
                 f"{symbol}: Invalidation TRIGGERED (priority 2) - momentum died "
                 f"(|z_ER|={abs_z_er:.2f} < {profile.invalidate_z_er_min})"
             )
+            pending.invalidation_details = details
             return "momentum_died"
 
         logger.debug(
@@ -1388,11 +1542,17 @@ class PositionManager:
 
             # Invalidate if threshold reached
             if pending.flow_death_bar_count >= profile.invalidate_taker_dominance_bars:
+                details = (
+                    f"Поток ордеров иссяк: {dominance_label}-доминирование = {current_dominance:.1%} "
+                    f"(порог: {profile.invalidate_taker_dominance_min:.0%}). "
+                    f"Подряд {pending.flow_death_bar_count} баров без поддержки направления."
+                )
                 logger.debug(
                     f"{symbol}: Invalidation TRIGGERED (priority 3) - flow died "
                     f"({pending.flow_death_bar_count} consecutive bars with "
                     f"{dominance_label} dominance < {profile.invalidate_taker_dominance_min})"
                 )
+                pending.invalidation_details = details
                 return "flow_died"
 
             logger.debug(
@@ -1412,10 +1572,24 @@ class PositionManager:
         # This flag is set elsewhere when pullback > max_pullback_pct/atr
         # =====================================================================
         if pending.pullback_exceeded_max:
+            pullback_pct = 0.0
+            peak_str = format_price(pending.peak_since_signal) if pending.peak_since_signal else "N/A"
+            close_str = format_price(bar.close) if bar.close else "N/A"
+            if pending.peak_since_signal and pending.signal_price:
+                if direction == Direction.UP:
+                    pullback_pct = (pending.peak_since_signal - bar.close) / pending.peak_since_signal * 100
+                else:
+                    pullback_pct = (bar.close - pending.peak_since_signal) / pending.peak_since_signal * 100
+            details = (
+                f"Структура сломана: откат {pullback_pct:.2f}% превысил максимум. "
+                f"Пик: {peak_str}, текущая: {close_str}. "
+                f"Слишком глубокая коррекция."
+            )
             logger.debug(
                 f"{symbol}: Invalidation TRIGGERED (priority 4) - structure broken "
                 f"(pullback exceeded max, flag was latched)"
             )
+            pending.invalidation_details = details
             return "structure_broken"
 
         logger.debug(
@@ -1428,10 +1602,18 @@ class PositionManager:
         # Already checked in _check_pending_signals, but include for completeness
         # =====================================================================
         if pending.is_expired(bar.ts_minute):
+            elapsed_minutes = (bar.ts_minute - pending.created_ts) // (60 * 1000)
+            max_wait = self.config.position_management.entry_trigger_max_wait_minutes
+            details = (
+                f"Время ожидания истекло: прошло {elapsed_minutes}m (лимит: {max_wait}m). "
+                f"Триггеры не сработали за {pending.bars_since_signal} баров. "
+                f"Сигнал устарел."
+            )
             logger.debug(
                 f"{symbol}: Invalidation TRIGGERED (priority 5) - TTL expired "
                 f"(current_ts={bar.ts_minute} >= expires_ts={pending.expires_ts})"
             )
+            pending.invalidation_details = details
             return "ttl_expired"
 
         logger.debug(
@@ -1536,10 +1718,23 @@ class PositionManager:
                     f"{position.symbol}: Stop loss moved to breakeven ({position.open_price:.6f})"
                 )
 
-            # Send Telegram notification
-            if self.config.alerts.telegram.enabled:
-                message = self._format_partial_profit_executed(position, current_price, current_pnl_pct)
-                await self._send_telegram(message)
+            # Send Telegram notification and save to audit log
+            message = self._format_partial_profit_executed(position, current_price, current_pnl_pct)
+            await self._send_and_save_alert(
+                alert_type="PARTIAL_PROFIT_EXECUTED",
+                symbol=position.symbol,
+                direction=position.direction.value,
+                message=message,
+                alert_id=f"partial_profit_{position.position_id}_{bar_ts}",
+                ts=bar_ts,
+                metadata={
+                    'position_id': position.position_id,
+                    'partial_profit_price': current_price,
+                    'partial_profit_pnl_percent': current_pnl_pct,
+                    'target_pnl_percent': target_distance_pct,
+                    'breakeven_stop_active': position.metrics.get('breakeven_stop_active', False)
+                }
+            )
 
             return True
 
@@ -1785,6 +1980,88 @@ class PositionManager:
 
         return None
 
+    def _generate_exit_reason_details(
+        self,
+        position: Position,
+        bar: Bar,
+        features: Features,
+        exit_reason: ExitReason
+    ) -> str:
+        """Generate human-readable detailed explanation for exit reason."""
+        cfg = self.config.position_management
+        direction_multiplier = 1 if position.direction == Direction.UP else -1
+        current_price = bar.close
+        pnl_pct = ((current_price - position.open_price) / position.open_price * 100) * direction_multiplier
+        duration_minutes = (bar.ts_minute - position.open_ts) // (60 * 1000)
+
+        if exit_reason == ExitReason.TRAILING_STOP:
+            trailing_price = position.metrics.get('trailing_stop_price', 0)
+            return (
+                f"Трейлинг-стоп сработал: цена {format_price(current_price)} достигла "
+                f"трейлинг-уровня {format_price(trailing_price)}. "
+                f"MFE: {position.max_favorable_excursion:+.2f}%, финальный PnL: {pnl_pct:+.2f}%."
+            )
+
+        elif exit_reason == ExitReason.STOP_LOSS:
+            # Check if it's a breakeven stop
+            if position.metrics.get('breakeven_stop_active'):
+                breakeven_price = position.metrics.get('breakeven_stop_price', position.open_price)
+                return (
+                    f"Безубыточный стоп сработал: цена {format_price(current_price)} вернулась к "
+                    f"уровню входа {format_price(breakeven_price)}. "
+                    f"Прибыль зафиксирована частичным закрытием ранее."
+                )
+            else:
+                stop_pct = position.metrics.get('dynamic_stop_loss', cfg.stop_loss_percent)
+                return (
+                    f"Стоп-лосс сработал: PnL достиг -{stop_pct:.1f}% "
+                    f"(вход: {format_price(position.open_price)}, текущая: {format_price(current_price)}). "
+                    f"MAE: {position.max_adverse_excursion:.2f}%."
+                )
+
+        elif exit_reason == ExitReason.TAKE_PROFIT:
+            tp_pct = position.metrics.get('dynamic_take_profit', cfg.take_profit_percent)
+            return (
+                f"Тейк-профит достигнут: PnL = +{pnl_pct:.2f}% (цель: +{tp_pct:.1f}%). "
+                f"Вход: {format_price(position.open_price)}, выход: {format_price(current_price)}. "
+                f"Длительность: {duration_minutes}m."
+            )
+
+        elif exit_reason == ExitReason.Z_SCORE_REVERSAL:
+            return (
+                f"Z-score ослаб: |z_ER| = {abs(features.z_er_15m):.2f}σ "
+                f"(порог выхода: {cfg.z_score_exit_threshold}σ). "
+                f"Был: {position.entry_z_er:.2f}σ. Импульс исчерпан."
+            )
+
+        elif exit_reason == ExitReason.ORDER_FLOW_REVERSAL:
+            taker_share = bar.taker_buy_share()
+            flow_direction = "продажи" if position.direction == Direction.UP else "покупки"
+            return (
+                f"Поток ордеров развернулся: доминируют {flow_direction}. "
+                f"Taker buy: {taker_share:.1%} (порог: {cfg.order_flow_reversal_threshold:.0%}). "
+                f"Противоположная сторона захватила контроль."
+            )
+
+        elif exit_reason == ExitReason.TIME_EXIT:
+            max_minutes = cfg.max_hold_minutes
+            return (
+                f"Выход по времени: позиция держалась {duration_minutes}m (лимит: {max_minutes}m). "
+                f"PnL: {pnl_pct:+.2f}%, MFE: {position.max_favorable_excursion:+.2f}%. "
+                f"Время истекло без достижения цели."
+            )
+
+        elif exit_reason == ExitReason.OPPOSITE_SIGNAL:
+            opposite = "DOWN" if position.direction == Direction.UP else "UP"
+            return (
+                f"Противоположный сигнал: z_ER = {features.z_er_15m:+.2f}σ указывает на {opposite}. "
+                f"Рынок развернулся против позиции. "
+                f"Порог противосигнала: {cfg.opposite_signal_threshold}σ."
+            )
+
+        else:
+            return f"Выход по причине: {exit_reason.value}"
+
     async def _close_position(
         self,
         position: Position,
@@ -1793,6 +2070,11 @@ class PositionManager:
         exit_reason: ExitReason
     ) -> None:
         """Close position and save to database."""
+        # Generate detailed exit reason explanation
+        exit_details = self._generate_exit_reason_details(
+            position, bar, features, exit_reason
+        )
+
         position.close_position(
             close_price=bar.close,
             close_ts=bar.ts_minute,
@@ -1800,6 +2082,7 @@ class PositionManager:
             exit_z_er=features.z_er_15m,
             exit_z_vol=features.z_vol_15m
         )
+        position.exit_reason_details = exit_details
 
         # Save to database
         await self.storage.write_position(position)
@@ -1814,10 +2097,27 @@ class PositionManager:
             f"Reason: {exit_reason.value} | Duration: {position.duration_minutes}m"
         )
 
-        # Send Telegram notification
-        if self.config.alerts.telegram.enabled:
-            message = self._format_position_closed(position)
-            await self._send_telegram(message)
+        # Send Telegram notification and save to audit log
+        message = self._format_position_closed(position)
+        await self._send_and_save_alert(
+            alert_type="POSITION_CLOSED",
+            symbol=position.symbol,
+            direction=position.direction.value,
+            message=message,
+            alert_id=f"position_closed_{position.position_id}",
+            ts=position.close_ts,
+            metadata={
+                'position_id': position.position_id,
+                'open_price': position.open_price,
+                'close_price': position.close_price,
+                'pnl_percent': position.pnl_percent,
+                'exit_reason': exit_reason.value,
+                'exit_reason_details': exit_details,
+                'duration_minutes': position.duration_minutes,
+                'max_favorable_excursion': position.max_favorable_excursion,
+                'max_adverse_excursion': position.max_adverse_excursion
+            }
+        )
 
     async def _send_telegram(self, message: str) -> None:
         """Send Telegram notification."""
@@ -1845,17 +2145,52 @@ class PositionManager:
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
 
+    async def _send_and_save_alert(
+        self,
+        alert_type: str,
+        symbol: str,
+        direction: str,
+        message: str,
+        alert_id: str,
+        ts: int,
+        metadata: dict = None
+    ) -> None:
+        """
+        Send alert to Telegram and save to database for audit.
+
+        Args:
+            alert_type: Type of alert (PENDING_SIGNAL_CREATED, POSITION_OPENED, etc.)
+            symbol: Trading symbol
+            direction: UP or DOWN
+            message: Formatted alert message
+            alert_id: Unique identifier for the alert
+            ts: Timestamp in milliseconds
+            metadata: Additional data to store
+        """
+        # Send to Telegram if enabled
+        if self.config.alerts.telegram.enabled:
+            await self._send_telegram(message)
+
+        # Always save to database for audit
+        await self.storage.write_alert(
+            alert_id=alert_id,
+            ts=ts,
+            alert_type=alert_type,
+            symbol=symbol,
+            direction=direction,
+            message_text=message,
+            metadata=metadata
+        )
+
     def _format_position_opened(self, position: Position) -> str:
         """Format message for position opened (immediate entry, no triggers)."""
         timestamp = datetime.fromtimestamp(position.open_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
         direction_emoji = "🟢" if position.direction == Direction.UP else "🔴"
-        status_emoji = "✅" if position.metrics.get('event_status') == 'CONFIRMED' else "⚠️"
 
         message = f"""📊 <b>POSITION OPENED</b>
 
 {direction_emoji} <b>{position.symbol} {position.direction.value}</b>
-{status_emoji} Status: {position.metrics.get('event_status', 'UNCONFIRMED')}
 
 💰 Entry Price: {format_price(position.open_price)}
 📈 Entry Z-scores:
@@ -1885,7 +2220,6 @@ class PositionManager:
         timestamp = datetime.fromtimestamp(position.open_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
         direction_emoji = "🟢" if position.direction == Direction.UP else "🔴"
-        status_emoji = "✅" if position.metrics.get('event_status') == 'CONFIRMED' else "⚠️"
 
         trigger_delay_bars = position.metrics.get('trigger_delay_bars', 0)
         trigger_delay_seconds = position.metrics.get('trigger_delay_seconds_approx', 0)
@@ -1893,12 +2227,12 @@ class PositionManager:
         message = f"""📊 <b>POSITION OPENED</b> (from pending signal)
 
 {direction_emoji} <b>{position.symbol} {position.direction.value}</b>
-{status_emoji} Status: {position.metrics.get('event_status', 'UNCONFIRMED')}
 
 ⏱️ <b>Entry Timing:</b>
-   • Signal → Entry: {trigger_delay_bars} bars
-   • Approx time: ~{trigger_delay_seconds}s
-   • Triggers met: z-cooldown ✓, pullback ✓, dominance ✓
+   • Signal → Entry: {trigger_delay_bars} bars (~{trigger_delay_seconds}s)
+
+📝 <b>Почему открыта:</b>
+{position.entry_reason_details if position.entry_reason_details else 'Все триггеры выполнены ✓'}
 
 💰 Entry Price: {format_price(position.open_price)}
 📈 Entry Z-scores:
@@ -1950,6 +2284,18 @@ class PositionManager:
         }
         exit_emoji = exit_emoji_map.get(position.exit_reason, "🚪")
 
+        # Human-readable exit reason names
+        exit_reason_names = {
+            ExitReason.TAKE_PROFIT: "🎯 Тейк-профит",
+            ExitReason.STOP_LOSS: "🛑 Стоп-лосс",
+            ExitReason.TRAILING_STOP: "📈 Трейлинг-стоп",
+            ExitReason.Z_SCORE_REVERSAL: "📉 Z-score ослаб",
+            ExitReason.ORDER_FLOW_REVERSAL: "🔄 Разворот потока",
+            ExitReason.TIME_EXIT: "⏱️ Выход по времени",
+            ExitReason.OPPOSITE_SIGNAL: "⚡ Противосигнал"
+        }
+        exit_reason_display = exit_reason_names.get(position.exit_reason, position.exit_reason.value if position.exit_reason else 'N/A')
+
         message = f"""💼 <b>POSITION CLOSED</b> {pnl_emoji}
 
 {direction_emoji} <b>{position.symbol} {position.direction.value}</b>
@@ -1962,7 +2308,10 @@ class PositionManager:
    • MAE (Worst): {position.max_adverse_excursion:+.2f}%
    • Duration: {position.duration_minutes}m
 
-{exit_emoji} <b>Exit Reason:</b> {position.exit_reason.value if position.exit_reason else 'N/A'}
+{exit_emoji} <b>Причина выхода:</b> {exit_reason_display}
+
+📝 <b>Детали:</b>
+{position.exit_reason_details if position.exit_reason_details else 'N/A'}
 
 📈 Exit Z-scores:
    • ER: {position.exit_z_er:.2f}σ
@@ -1979,27 +2328,68 @@ class PositionManager:
         timestamp = datetime.fromtimestamp(pending.created_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
         direction_emoji = "🟢" if pending.direction == Direction.UP else "🔴"
-        status_emoji = "✅" if event.status == EventStatus.CONFIRMED else "⚠️"
+        direction_ru = "ЛОНГ" if pending.direction == Direction.UP else "ШОРТ"
+
+        # Get metrics from event
+        metrics = event.metrics
+        z_er = metrics.get('z_er', pending.signal_z_er)
+        z_vol = metrics.get('z_vol', pending.signal_z_vol)
+        taker_share = metrics.get('taker_share', 0)
+        beta = metrics.get('beta', 0)
+        funding = metrics.get('funding', 0)
+
+        # Generate detailed reason for signal creation
+        cfg = self.config.position_management
+        taker_threshold_high = 0.65
+        taker_threshold_low = 0.35
+
+        # Determine flow direction
+        if taker_share >= taker_threshold_high:
+            flow_description = f"Агрессивные покупки: taker buy = {taker_share:.1%} (≥ {taker_threshold_high:.0%})"
+        elif taker_share <= taker_threshold_low:
+            flow_description = f"Агрессивные продажи: taker buy = {taker_share:.1%} (≤ {taker_threshold_low:.0%})"
+        else:
+            flow_description = f"Taker buy share: {taker_share:.1%}"
+
+        # Build detection reason
+        detection_details = (
+            f"Обнаружен аномальный импульс {direction_ru}:\n"
+            f"   • Z-score ER: {z_er:.2f}σ (порог: ≥3.0σ) ✓\n"
+            f"   • Z-score VOL: {z_vol:.2f}σ (порог: ≥3.0σ) ✓\n"
+            f"   • {flow_description} ✓"
+        )
+
+        # Entry requirements
+        entry_requirements = (
+            f"Для входа в позицию требуется:\n"
+            f"   • Z-score остынет до [{cfg.entry_trigger_z_cooldown:.1f}, 3.0]σ\n"
+            f"   • Откат от пика ≥ {cfg.entry_trigger_pullback_pct:.1f}%\n"
+            f"   • Flow-доминирование ≥ {cfg.entry_trigger_min_taker_dominance:.0%}"
+        )
 
         message = f"""⏳ <b>PENDING SIGNAL CREATED</b>
 
 {direction_emoji} <b>{pending.symbol} {pending.direction.value}</b>
-{status_emoji} Status: {event.status.value}
 
-📊 <b>Signal Metrics:</b>
+📊 <b>Метрики сигнала:</b>
    • Z-Score (ER): {pending.signal_z_er:.2f}σ
    • Z-Score (VOL): {pending.signal_z_vol:.2f}σ
-   • Price: {format_price(pending.signal_price)}
-   • Peak: {format_price(pending.peak_since_signal)}
+   • Цена: {format_price(pending.signal_price)}
+   • Пик: {format_price(pending.peak_since_signal)}
+   • Beta vs BTC: {beta:.2f}
+   • Funding: {funding:.4%}
+
+📝 <b>Почему создан сигнал:</b>
+{detection_details}
+
+🎯 <b>Условия входа:</b>
+{entry_requirements}
 
 ⏱️ <b>Watch Window:</b>
-   • Max wait: {self.config.position_management.entry_trigger_max_wait_minutes}m
-   • Will enter AS SOON AS triggers met:
-      - Z-score cooldown ✓
-      - Price pullback ✓
-      - Taker flow stable + dominant ✓
+   • Макс. ожидание: {cfg.entry_trigger_max_wait_minutes}m
+   • Вход: как только все триггеры сработают
 
-🕐 Time: {timestamp}
+🕐 Время: {timestamp}
 🆔 ID: {pending.signal_id}
 """
 
@@ -2011,11 +2401,24 @@ class PositionManager:
 
         direction_emoji = "🟢" if pending.direction == Direction.UP else "🔴"
 
+        # Human-readable reason mapping
+        reason_names = {
+            "direction_flip": "🔄 Разворот направления",
+            "momentum_died": "📉 Импульс угас",
+            "flow_died": "💧 Поток ордеров иссяк",
+            "structure_broken": "🔨 Структура сломана",
+            "ttl_expired": "⏰ Время истекло"
+        }
+        reason_display = reason_names.get(pending.invalidation_reason, pending.invalidation_reason)
+
         message = f"""❌ <b>PENDING SIGNAL INVALIDATED</b>
 
 {direction_emoji} <b>{pending.symbol} {pending.direction.value}</b>
 
-⚠️ <b>Invalidation Reason:</b> {pending.invalidation_reason}
+⚠️ <b>Причина:</b> {reason_display}
+
+📝 <b>Детали:</b>
+{pending.invalidation_details if pending.invalidation_details else 'N/A'}
 
 📊 <b>Signal Metrics (at creation):</b>
    • Z-Score (ER): {pending.signal_z_er:.2f}σ

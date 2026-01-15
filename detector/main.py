@@ -10,7 +10,6 @@ from detector.binance_rest import BinanceRestClient
 from detector.aggregator import BarAggregator
 from detector.features import FeatureCalculator
 from detector.detector import AnomalyDetector
-from detector.alerts import AlertDispatcher
 from detector.position_manager import PositionManager
 from detector.report import ReportGenerator
 from detector.backfill import Backfiller
@@ -50,7 +49,6 @@ class SectorShotDetector:
         self.bar_queue_pm = asyncio.Queue(maxsize=1000)  # Separate queue for position manager
         self.feature_queue = asyncio.Queue(maxsize=1000)
         self.feature_queue_pm = asyncio.Queue(maxsize=1000)  # For position manager exit checks
-        self.event_queue = asyncio.Queue(maxsize=100)
         self.event_queue_pm = asyncio.Queue(maxsize=100)  # For position manager to open positions
 
         # Components
@@ -89,14 +87,11 @@ class SectorShotDetector:
 
         self.detector = AnomalyDetector(
             self.feature_queue,
-            self.event_queue,
             self.rest_client,
             self.storage,
             config,
-            extra_event_queues=extra_event_queues
+            event_queues=extra_event_queues  # Only position manager queue
         )
-
-        self.alerts = AlertDispatcher(self.event_queue, config)
 
         # Position manager (if enabled)
         self.position_manager = None
@@ -225,7 +220,6 @@ class SectorShotDetector:
             asyncio.create_task(self.aggregator.run(), name="aggregator"),
             asyncio.create_task(self.features.run(), name="features"),
             asyncio.create_task(self.detector.run(), name="detector"),
-            asyncio.create_task(self.alerts.run(), name="alerts"),
             asyncio.create_task(self._storage_flush_loop(), name="storage_flush"),
             asyncio.create_task(self._health_monitor(), name="health"),
         ]

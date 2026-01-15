@@ -12,7 +12,7 @@ import asyncio
 from unittest.mock import AsyncMock
 from detector.position_manager import PositionManager
 from detector.config import Config, PositionManagementConfig, WinRateMaxProfileConfig
-from detector.models import Bar, Features, Direction, Event, EventStatus, PendingSignal
+from detector.models import Bar, Features, Direction, Event, PendingSignal
 from detector.features_extended import ExtendedFeatureCalculator
 from detector.storage import Storage
 from datetime import datetime
@@ -477,8 +477,7 @@ def test_z_cooldown_declining_passes_for_now(config_win_rate_max, mock_storage):
         event_id="test_event_1",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -512,8 +511,7 @@ def test_z_cooldown_declining_skips_for_default(config_default, mock_storage):
         event_id="test_event_2",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -566,8 +564,7 @@ def test_re_expansion_price_action_long(config_win_rate_max, mock_storage):
         event_id="test_event_3",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -608,8 +605,7 @@ def test_re_expansion_micro_impulse_short(config_win_rate_max, mock_storage):
         event_id="test_event_4",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.DOWN,
-        status=EventStatus.CONFIRMED
+        direction=Direction.DOWN
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_DOWN",
@@ -651,8 +647,7 @@ def test_re_expansion_flow_acceleration_long(config_win_rate_max, mock_storage):
         event_id="test_event_5",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -709,8 +704,7 @@ def test_re_expansion_requires_at_least_one_method(config_win_rate_max, mock_sto
         event_id="test_event_6",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -753,8 +747,7 @@ def test_re_expansion_disabled_always_passes(config_win_rate_max, mock_storage):
         event_id="test_event_7",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -795,8 +788,7 @@ def test_re_expansion_skips_for_default_profile(config_default, mock_storage):
         event_id="test_event_8",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -836,8 +828,7 @@ def test_invalidation_priority_1_direction_flip(config_win_rate_max, mock_storag
         event_id="test_event_9",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -875,8 +866,7 @@ def test_invalidation_priority_2_momentum_died(config_win_rate_max, mock_storage
         event_id="test_event_10",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -914,8 +904,7 @@ def test_invalidation_priority_3_flow_died_after_two_bars(config_win_rate_max, m
         event_id="test_event_11",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -960,8 +949,7 @@ def test_invalidation_priority_4_structure_broken(config_win_rate_max, mock_stor
         event_id="test_event_12",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -1002,8 +990,7 @@ def test_invalidation_priority_5_ttl_expired(config_win_rate_max, mock_storage):
         event_id="test_event_13",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     current_ts = int(datetime.now().timestamp() * 1000)
     pending = PendingSignal(
@@ -1045,8 +1032,7 @@ def test_invalidation_priority_order_first_match_wins(config_win_rate_max, mock_
         event_id="test_event_14",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     current_ts = int(datetime.now().timestamp() * 1000)
     pending = PendingSignal(
@@ -1088,8 +1074,7 @@ def test_invalidation_flow_death_counter_resets_on_recovery(config_win_rate_max,
         event_id="test_event_15",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -1138,8 +1123,7 @@ def test_invalidation_skips_for_default_profile(config_default, mock_storage):
         event_id="test_event_16",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     pending = PendingSignal(
         signal_id="ETHUSDT_test_UP",
@@ -1177,8 +1161,7 @@ def test_invalidation_no_rules_triggered(config_win_rate_max, mock_storage):
         event_id="test_event_17",
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
-        direction=Direction.UP,
-        status=EventStatus.CONFIRMED
+        direction=Direction.UP
     )
     current_ts = int(datetime.now().timestamp() * 1000)
     pending = PendingSignal(
@@ -1255,7 +1238,7 @@ async def test_partial_profit_executes_at_target(mock_storage):
     bar_ts = int(datetime.now().timestamp() * 1000)
 
     # ACT
-    result = pm._execute_partial_profit(position, current_price, bar_ts)
+    result = await pm._execute_partial_profit(position, current_price, bar_ts)
 
     # ASSERT
     assert result is True, "Partial profit should execute"
@@ -1304,7 +1287,7 @@ async def test_partial_profit_only_executes_once(mock_storage):
     bar_ts = int(datetime.now().timestamp() * 1000)
 
     # ACT
-    result = pm._execute_partial_profit(position, current_price, bar_ts)
+    result = await pm._execute_partial_profit(position, current_price, bar_ts)
 
     # ASSERT
     assert result is False, "Should not execute again (already executed)"
@@ -1351,7 +1334,7 @@ async def test_partial_profit_moves_sl_to_breakeven(mock_storage):
     bar_ts = int(datetime.now().timestamp() * 1000)
 
     # ACT
-    result = pm._execute_partial_profit(position, current_price, bar_ts)
+    result = await pm._execute_partial_profit(position, current_price, bar_ts)
 
     # ASSERT
     assert result is True, "Partial profit should execute"
@@ -1499,7 +1482,7 @@ async def test_partial_profit_skips_for_default_profile(mock_storage):
     bar_ts = int(datetime.now().timestamp() * 1000)
 
     # ACT
-    result = pm._execute_partial_profit(position, current_price, bar_ts)
+    result = await pm._execute_partial_profit(position, current_price, bar_ts)
 
     # ASSERT
     assert result is False, "Should skip for DEFAULT profile"
@@ -1631,7 +1614,7 @@ async def test_integration_default_profile_unchanged_end_to_end(config_default, 
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
         direction=Direction.UP,
-        status=EventStatus.CONFIRMED,
+        
         metrics={'z_er': 3.5, 'z_vol': 3.2, 'beta': 0.8}
     )
 
@@ -1679,7 +1662,7 @@ async def test_integration_win_rate_max_requires_re_expansion(config_win_rate_ma
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
         direction=Direction.UP,
-        status=EventStatus.CONFIRMED,
+        
         metrics={'z_er': 3.5, 'z_vol': 3.2}
     )
 
@@ -1760,7 +1743,7 @@ async def test_integration_ttl_and_min_wait_respected(config_win_rate_max, mock_
         ts=int(datetime.now().timestamp() * 1000),
         initiator_symbol="ETHUSDT",
         direction=Direction.UP,
-        status=EventStatus.CONFIRMED,
+        
         metrics={'z_er': 3.5, 'z_vol': 3.2}
     )
 

@@ -19,41 +19,6 @@ class Direction(str, Enum):
     DOWN = "DOWN"
 
 
-class EventStatus(str, Enum):
-    """Event confirmation status."""
-    CONFIRMED = "CONFIRMED"
-    PARTIAL = "PARTIAL"
-    UNCONFIRMED = "UNCONFIRMED"
-    SECTOR_DIFFUSION = "SECTOR_DIFFUSION"
-
-
-@dataclass
-class DataAvailability:
-    """Tracks available data sources for graceful degradation."""
-    has_api_key: bool = False
-    has_oi: bool = False
-    has_taker_ratio: bool = False
-    has_liquidations: bool = False
-    has_funding: bool = False
-
-    def confirmation_level(self) -> EventStatus:
-        """Determine confirmation level based on available data."""
-        if not self.has_api_key:
-            return EventStatus.UNCONFIRMED
-
-        available = sum([
-            self.has_oi,
-            self.has_taker_ratio,
-            self.has_liquidations,
-            self.has_funding
-        ])
-
-        if available >= 2:
-            return EventStatus.CONFIRMED
-        elif available == 1:
-            return EventStatus.PARTIAL
-        else:
-            return EventStatus.UNCONFIRMED
 
 
 @dataclass
@@ -156,13 +121,11 @@ class Features:
 
 @dataclass
 class Event:
-    """Detected anomaly event."""
+    """Detected anomaly event (initiator signal)."""
     event_id: str
     ts: int  # Event timestamp, milliseconds since epoch
     initiator_symbol: str
     direction: Direction
-    status: EventStatus
-    followers: List[str] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -172,8 +135,6 @@ class Event:
             'ts': self.ts,
             'initiator_symbol': self.initiator_symbol,
             'direction': self.direction.value,
-            'status': self.status.value,
-            'followers': self.followers,
             'metrics': self.metrics
         }
 
@@ -211,7 +172,8 @@ class PendingSignal:
 
     # Must-Fix #8: Invalidation flag for immediate removal
     invalidated: bool = False
-    invalidation_reason: Optional[str] = None
+    invalidation_reason: Optional[str] = None  # Short code: "flow_died", "momentum_died", etc.
+    invalidation_details: Optional[str] = None  # Human-readable detailed explanation
 
     # Trigger state (updated on each bar)
     z_cooldown_met: bool = False
@@ -254,12 +216,6 @@ class PendingSignal:
         return self.z_cooldown_met and self.pullback_met and self.stability_met
 
 
-@dataclass
-class PendingSectorEvent:
-    """Tracks pending sector diffusion events."""
-    initiator: Event
-    window_end: int  # Milliseconds since epoch
-    followers: List[Features] = field(default_factory=list)
 
 
 @dataclass
@@ -302,6 +258,7 @@ class Position:
     entry_z_er: float
     entry_z_vol: float
     entry_taker_share: float
+    entry_reason_details: Optional[str] = None  # Human-readable entry trigger explanation
 
     # Exit data (None if still open)
     close_price: Optional[float] = None
@@ -309,6 +266,7 @@ class Position:
     exit_z_er: Optional[float] = None
     exit_z_vol: Optional[float] = None
     exit_reason: Optional[ExitReason] = None
+    exit_reason_details: Optional[str] = None  # Human-readable detailed explanation
 
     # PnL metrics
     pnl_percent: Optional[float] = None  # (close - open) / open * 100 * direction_multiplier
