@@ -37,7 +37,57 @@ WS Streams → Aggregator (1m bars) → Features (z-scores, beta) → Detector (
 
 ## Installation
 
-### 1. Install Poetry
+### Option 1: Docker (Recommended)
+
+**Fastest way to get started!** No Python or Poetry installation required.
+
+#### Prerequisites
+- Docker installed ([Get Docker](https://docs.docker.com/get-docker/))
+- Docker Compose installed (included with Docker Desktop)
+
+#### Quick Start
+
+```bash
+# 1. Clone repository
+git clone https://github.com/arigandores/binance_futures_trader.git
+cd binance_futures_trader
+
+# 2. Create configuration file
+cp config.example.yaml config.yaml
+# Edit config.yaml with your settings (symbols, thresholds, API keys, etc.)
+
+# 3. Build and run with Docker Compose
+docker-compose up -d
+
+# 4. View logs
+docker-compose logs -f detector
+
+# 5. Check status
+docker-compose ps
+```
+
+**That's it!** The detector will automatically backfill historical data and start monitoring.
+
+See **[DOCKER.md](DOCKER.md)** for complete Docker documentation including:
+- All CLI modes (run, backfill, db-migrate, report)
+- Troubleshooting guide
+- Production deployment
+- Advanced configurations
+
+#### Docker Features
+- ✅ Production-ready multi-stage build
+- ✅ Non-root user security (OWASP compliant)
+- ✅ Volume persistence for SQLite database
+- ✅ Auto-restart policy
+- ✅ Health checks every 60 seconds
+- ✅ All detector modes supported
+- ✅ Expected image size: 200-300MB
+
+### Option 2: Local Installation
+
+If you prefer to run without Docker:
+
+#### 1. Install Poetry
 
 ```bash
 # Linux/macOS
@@ -47,19 +97,20 @@ curl -sSL https://install.python-poetry.org | python3 -
 (Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | python -
 ```
 
-### 2. Clone Repository
+#### 2. Clone Repository
 
 ```bash
-cd BinanceAlertManager
+git clone https://github.com/arigandores/binance_futures_trader.git
+cd binance_futures_trader
 ```
 
-### 3. Install Dependencies
+#### 3. Install Dependencies
 
 ```bash
 poetry install
 ```
 
-### 4. Configure
+#### 4. Configure
 
 ```bash
 cp config.example.yaml config.yaml
@@ -76,7 +127,7 @@ api:
 
 **Without API key**: Service will continue with WebSocket-only features, marking events as `UNCONFIRMED`.
 
-### 5. Initialize Database
+#### 5. Initialize Database
 
 ```bash
 poetry run python -m detector db-migrate
@@ -435,7 +486,11 @@ BinanceAlertManager/
 ├── config.example.yaml      # Configuration template
 ├── README.md                # This file
 ├── CLAUDE.md                # Claude Code development guide
-├── check_positions.py       # Position reporting script (NEW)
+├── DOCKER.md                # Docker usage documentation (NEW)
+├── Dockerfile               # Multi-stage Docker build (NEW)
+├── docker-compose.yml       # Docker Compose orchestration (NEW)
+├── .dockerignore            # Docker build optimization (NEW)
+├── check_positions.py       # Position reporting script
 ├── check_database.py        # Database diagnostics script
 ├── detector/
 │   ├── __init__.py

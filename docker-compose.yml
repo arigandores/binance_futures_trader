@@ -1,0 +1,45 @@
+# docker-compose.yml for Binance Sector Shot Detector
+# Production-ready orchestration with volume persistence
+
+version: '3.8'
+
+services:
+  detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: binance-detector
+    restart: unless-stopped
+
+    # Run as non-root user (matches Dockerfile UID/GID)
+    user: "1000:1000"
+
+    # Volume mounts
+    volumes:
+      # Named volume for SQLite database persistence
+      - detector-data:/app/data
+
+      # Read-only mount for configuration
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    # Health check to monitor service status
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; conn=sqlite3.connect('/app/data/market.db'); conn.close()"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+    # No ports exposed - WebSocket client mode (outbound connections only)
+    # Uncomment below if Telegram webhook mode is needed in future:
+    # ports:
+    #   - "8443:8443"
+
+# Named volumes for data persistence
+volumes:
+  detector-data:
+    driver: local

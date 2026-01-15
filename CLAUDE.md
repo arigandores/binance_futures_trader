@@ -22,11 +22,57 @@ The detector monitors futures markets for "sector shot" anomalies - coordinated 
 ## Development Setup
 
 ### Prerequisites
+
+**Option 1: Docker (Recommended for Production)**
+- Docker installed
+- Docker Compose installed
+
+**Option 2: Local Development**
 - Python 3.12 or higher
 - Poetry installed
 - Optional: Binance API key/secret for advanced features (OI, liquidations, funding rate)
 
-### Installation Steps
+### Docker Installation (Production-Ready)
+
+**Fastest way to deploy!** Complete Docker support with multi-stage builds, security hardening, and volume persistence.
+
+```bash
+# 1. Clone repository
+git clone https://github.com/arigandores/binance_futures_trader.git
+cd binance_futures_trader
+
+# 2. Create configuration
+cp config.example.yaml config.yaml
+# Edit config.yaml with your settings
+
+# 3. Build and run
+docker-compose up -d
+
+# 4. View logs
+docker-compose logs -f detector
+
+# 5. Check positions (optional)
+docker-compose exec detector python check_positions.py
+```
+
+**Docker Features:**
+- ✅ Multi-stage build (Poetry builder + slim runtime)
+- ✅ Non-root user (appuser, UID 1000) - OWASP compliant
+- ✅ Volume persistence for SQLite database
+- ✅ Read-only config mount for safety
+- ✅ Auto-restart policy (`unless-stopped`)
+- ✅ Health checks every 60 seconds
+- ✅ All CLI modes supported (run, backfill, db-migrate, report)
+- ✅ Expected image size: 200-300MB
+
+**See DOCKER.md for complete documentation:**
+- All operational modes
+- Troubleshooting guide (7 common issues)
+- Production deployment recommendations
+- Advanced configurations (resource limits, monitoring)
+- Architecture explanation
+
+### Local Installation Steps
 
 ```bash
 # 1. Navigate to project directory

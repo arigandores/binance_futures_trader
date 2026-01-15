@@ -1,0 +1,71 @@
+# .dockerignore - Optimize Docker build context
+# Exclude unnecessary files to speed up builds and reduce image size
+
+# Virtual environments (will be rebuilt by Poetry in container)
+.venv/
+venv/
+ENV/
+env/
+
+# Python caches and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Database files (use volumes for persistence, not image layers)
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Git repository
+.git/
+.gitignore
+.gitattributes
+
+# Documentation (keep README.md, exclude others)
+*.md
+!README.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Temporary and log files
+*.log
+*.tmp
+nul
+temp/
+tmp/
+
+# Test artifacts
+.coverage
+htmlcov/
+.tox/
+
+# Build artifacts
+dist/
+build/
+*.egg
+
+# Research and planning documents (not needed in container)
+ResearchPack_*.md
+ImplementationPlan_*.md
+*_FIX_PLAN.md
+*_SUMMARY.md
+*_VERIFICATION.md
+*_COMPLETE.md
+TELEGRAM_NOTIFICATIONS.md
+WIN_RATE_MAX_NO_SECTOR_profile.md
+CHECK_POSITIONS_VERIFICATION.md
+
+# Test scripts
+test_*.py
+check_*.py
