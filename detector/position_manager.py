@@ -1020,6 +1020,171 @@ class PositionManager:
         )
         return True  # Allow trading
 
+    # =========================================================================
+    # WIN_RATE_MAX Profile: Entry Validation (Step 4.2)
+    # =========================================================================
+
+    def _check_z_cooldown_declining(self, pending: PendingSignal, features: Features) -> bool:
+        """
+        Check if z-score is NOT declining 2 bars in a row.
+
+        For WIN_RATE_MAX profile only. Prevents entry when momentum is fading.
+        This is a "cooled and dying" protection - if z-score declined for 2 consecutive
+        bars, momentum may be exhausted rather than consolidating.
+
+        NOTE: This method requires features history (z-score for last 3 bars) which
+        is not currently maintained in ExtendedFeatureCalculator. For now, this is
+        a pass-through that returns True. When features window is implemented,
+        this method will check: z[-2] > z[-1] AND z[-1] > z[0] (declining pattern).
+
+        Args:
+            pending: Pending signal being evaluated
+            features: Current features for the symbol
+
+        Returns:
+            True if z-score not declining (safe to enter), False if declining 2 bars
+        """
+        # Skip for DEFAULT profile
+        if self.config.position_management.profile != "WIN_RATE_MAX":
+            return True
+
+        symbol = pending.symbol
+
+        # TODO: Implement when features history is available in ExtendedFeatureCalculator
+        # This requires maintaining a rolling window of Features (similar to bars_windows)
+        # and tracking z_er_15m values for the last 3 bars.
+        #
+        # Future implementation:
+        # 1. Add features_windows: Dict[str, deque[Features]] to ExtendedFeatureCalculator
+        # 2. Update features window on each features update
+        # 3. Check: if z[-2] > z[-1] > z[0] (declining 2 bars), return False
+        #
+        # For now, return True to not block entry due to missing infrastructure.
+
+        logger.debug(
+            f"{symbol}: Z-cooldown declining check SKIPPED "
+            f"(features history not yet implemented - pass-through)"
+        )
+        return True  # Don't block entry due to missing infrastructure
+
+    def _check_re_expansion(self, pending: PendingSignal, bar: Bar, features: Features) -> bool:
+        """
+        Check if re-expansion is confirmed (1 of 3 methods).
+
+        Re-expansion validates that momentum is resuming after pullback.
+        This is critical for WIN_RATE_MAX profile to avoid entering during
+        dead-cat bounces or continued decline.
+
+        Methods (require 1 of 3):
+        1. Price action: close > prev_high (for LONG) / close < prev_low (for SHORT)
+        2. Micro impulse: bar return in signal direction (bar_return > 0 for LONG)
+        3. Flow acceleration: taker dominance increasing 2 bars in a row
+
+        Args:
+            pending: Pending signal being evaluated
+            bar: Current 1-minute bar
+            features: Current features for the symbol
+
+        Returns:
+            True if re-expansion confirmed (at least 1 method passed), False otherwise
+        """
+        # Skip for DEFAULT profile
+        if self.config.position_management.profile != "WIN_RATE_MAX":
+            return True
+
+        profile = self.config.position_management.win_rate_max_profile
+
+        # If re-expansion not required, pass through
+        if not profile.require_re_expansion:
+            return True
+
+        symbol = pending.symbol
+        direction = pending.direction
+
+        # Track which methods passed
+        methods_passed = []
+
+        # Method 1: Price action (close > prev_high for LONG / close < prev_low for SHORT)
+        if profile.re_expansion_price_action:
+            bars = list(self.extended_features.bars_windows.get(symbol, []))
+            if len(bars) >= 2:
+                prev_bar = bars[-2]
+                current_bar = bars[-1]
+
+                if direction == Direction.UP:
+                    if current_bar.close > prev_bar.high:
+                        methods_passed.append("price_action")
+                        logger.debug(
+                            f"{symbol}: Re-expansion via PRICE_ACTION "
+                            f"(close {current_bar.close:.4f} > prev_high {prev_bar.high:.4f})"
+                        )
+                else:  # Direction.DOWN
+                    if current_bar.close < prev_bar.low:
+                        methods_passed.append("price_action")
+                        logger.debug(
+                            f"{symbol}: Re-expansion via PRICE_ACTION "
+                            f"(close {current_bar.close:.4f} < prev_low {prev_bar.low:.4f})"
+                        )
+
+        # Method 2: Micro impulse (bar return in signal direction)
+        if profile.re_expansion_micro_impulse:
+            bar_return = self.extended_features.get_bar_return(symbol)
+            if bar_return is not None:
+                if direction == Direction.UP and bar_return > 0:
+                    methods_passed.append("micro_impulse")
+                    logger.debug(
+                        f"{symbol}: Re-expansion via MICRO_IMPULSE "
+                        f"(bar_return {bar_return:.4f} > 0 for LONG)"
+                    )
+                elif direction == Direction.DOWN and bar_return < 0:
+                    methods_passed.append("micro_impulse")
+                    logger.debug(
+                        f"{symbol}: Re-expansion via MICRO_IMPULSE "
+                        f"(bar_return {bar_return:.4f} < 0 for SHORT)"
+                    )
+
+        # Method 3: Flow acceleration (taker dominance increasing/decreasing 2 bars)
+        if profile.re_expansion_flow_acceleration:
+            flow_bars = self.extended_features.get_flow_acceleration_bars(symbol, lookback=2)
+            if flow_bars is not None and len(flow_bars) == 3:
+                # flow_bars = [oldest, middle, newest] (3 bars for 2-bar comparison)
+                # For LONG: want buy dominance increasing (flow[0] < flow[1] < flow[2])
+                # For SHORT: want sell dominance increasing (buy share decreasing)
+
+                if direction == Direction.UP:
+                    # Buy dominance increasing = bullish flow acceleration
+                    if flow_bars[0] < flow_bars[1] < flow_bars[2]:
+                        methods_passed.append("flow_acceleration")
+                        logger.debug(
+                            f"{symbol}: Re-expansion via FLOW_ACCELERATION "
+                            f"(buy dominance increasing: {flow_bars[0]:.3f} < {flow_bars[1]:.3f} < {flow_bars[2]:.3f})"
+                        )
+                else:  # Direction.DOWN
+                    # Sell dominance increasing = buy share decreasing
+                    if flow_bars[0] > flow_bars[1] > flow_bars[2]:
+                        methods_passed.append("flow_acceleration")
+                        logger.debug(
+                            f"{symbol}: Re-expansion via FLOW_ACCELERATION "
+                            f"(sell dominance increasing: buy share {flow_bars[0]:.3f} > {flow_bars[1]:.3f} > {flow_bars[2]:.3f})"
+                        )
+
+        # Result: at least 1 method passed?
+        re_expansion_confirmed = len(methods_passed) > 0
+
+        if re_expansion_confirmed:
+            logger.debug(
+                f"{symbol}: Re-expansion CONFIRMED via methods: {methods_passed}"
+            )
+        else:
+            logger.debug(
+                f"{symbol}: Re-expansion NOT confirmed (no methods passed) - "
+                f"checked: price_action={profile.re_expansion_price_action}, "
+                f"micro_impulse={profile.re_expansion_micro_impulse}, "
+                f"flow_acceleration={profile.re_expansion_flow_acceleration}"
+            )
+
+        return re_expansion_confirmed
+
     async def _update_trailing_stop(
         self,
         position: Position,

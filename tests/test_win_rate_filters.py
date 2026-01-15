@@ -12,10 +12,11 @@ import asyncio
 from unittest.mock import AsyncMock
 from detector.position_manager import PositionManager
 from detector.config import Config, PositionManagementConfig, WinRateMaxProfileConfig
-from detector.models import Bar, Features, Direction
+from detector.models import Bar, Features, Direction, Event, EventStatus, PendingSignal
 from detector.features_extended import ExtendedFeatureCalculator
 from detector.storage import Storage
 from datetime import datetime
+from collections import deque
 
 
 @pytest.fixture
@@ -453,3 +454,360 @@ def test_beta_quality_negative_beta_within_range(config_win_rate_max, mock_stora
 
     # ASSERT
     assert result is True, "Should allow negative beta when |beta| within [beta_min_abs, beta_max_abs]"
+
+
+# =========================================================================
+# Test Group 4: _check_z_cooldown_declining (2 tests)
+# =========================================================================
+
+def test_z_cooldown_declining_passes_for_now(config_win_rate_max, mock_storage):
+    """Z-cooldown declining check passes (pass-through until features history implemented)."""
+    # ARRANGE
+    config_win_rate_max.position_management.profile = "WIN_RATE_MAX"
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create pending signal
+    event = Event(
+        event_id="test_event_1",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    # Create features
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_z_cooldown_declining(pending, features)
+
+    # ASSERT
+    assert result is True, "Should pass (return True) until features history implemented"
+
+
+def test_z_cooldown_declining_skips_for_default(config_default, mock_storage):
+    """Z-cooldown declining check skipped for DEFAULT profile."""
+    # ARRANGE
+    pm = create_position_manager(config_default, mock_storage)
+
+    # Create pending signal
+    event = Event(
+        event_id="test_event_2",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    # Create features (even with declining z-score pattern, should skip)
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_z_cooldown_declining(pending, features)
+
+    # ASSERT
+    assert result is True, "Should skip check for DEFAULT profile (always return True)"
+
+
+# =========================================================================
+# Test Group 5: _check_re_expansion (3 tests)
+# =========================================================================
+
+def test_re_expansion_price_action_long(config_win_rate_max, mock_storage):
+    """Re-expansion price action method works for LONG signals."""
+    # ARRANGE
+    config_win_rate_max.position_management.profile = "WIN_RATE_MAX"
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_price_action = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_micro_impulse = False
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_flow_acceleration = False
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create bars: prev_bar (high=100), current_bar (close=101 > prev_high)
+    prev_bar = create_bar(symbol="ETHUSDT", close=99.0)
+    prev_bar.high = 100.0
+
+    current_bar = create_bar(symbol="ETHUSDT", close=101.0)
+    current_bar.high = 101.0
+
+    # Add bars to extended features window
+    pm.extended_features.bars_windows["ETHUSDT"] = deque([prev_bar, current_bar], maxlen=100)
+
+    # Create pending signal (Direction.UP)
+    event = Event(
+        event_id="test_event_3",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_re_expansion(pending, current_bar, features)
+
+    # ASSERT
+    assert result is True, "Price action expansion should pass (close > prev_high for LONG)"
+
+
+def test_re_expansion_micro_impulse_short(config_win_rate_max, mock_storage):
+    """Re-expansion micro impulse method works for SHORT signals."""
+    # ARRANGE
+    config_win_rate_max.position_management.profile = "WIN_RATE_MAX"
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_price_action = False
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_micro_impulse = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_flow_acceleration = False
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Mock get_bar_return to return negative value (bearish)
+    pm.extended_features.get_bar_return = lambda symbol: -0.01
+
+    # Create pending signal (Direction.DOWN)
+    event = Event(
+        event_id="test_event_4",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.DOWN,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_DOWN",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.DOWN,
+        symbol="ETHUSDT",
+        signal_z_er=-3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    current_bar = create_bar(symbol="ETHUSDT", close=99.0)
+    features = create_features(symbol="ETHUSDT", z_er=-2.5)
+
+    # ACT
+    result = pm._check_re_expansion(pending, current_bar, features)
+
+    # ASSERT
+    assert result is True, "Micro impulse expansion should pass (negative return for SHORT)"
+
+
+def test_re_expansion_flow_acceleration_long(config_win_rate_max, mock_storage):
+    """Re-expansion flow acceleration method works for LONG signals."""
+    # ARRANGE
+    config_win_rate_max.position_management.profile = "WIN_RATE_MAX"
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_price_action = False
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_micro_impulse = False
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_flow_acceleration = True
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Mock get_flow_acceleration_bars to return increasing buy dominance
+    pm.extended_features.get_flow_acceleration_bars = lambda symbol, lookback: [0.50, 0.55, 0.60]
+
+    # Create pending signal (Direction.UP)
+    event = Event(
+        event_id="test_event_5",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    current_bar = create_bar(symbol="ETHUSDT", close=101.0)
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_re_expansion(pending, current_bar, features)
+
+    # ASSERT
+    assert result is True, "Flow acceleration expansion should pass (increasing buy dominance for LONG)"
+
+
+# =========================================================================
+# Test Group 6: Additional Edge Case Tests (Bonus)
+# =========================================================================
+
+def test_re_expansion_requires_at_least_one_method(config_win_rate_max, mock_storage):
+    """Re-expansion fails when no methods pass (no expansion confirmed)."""
+    # ARRANGE
+    config_win_rate_max.position_management.profile = "WIN_RATE_MAX"
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_price_action = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_micro_impulse = True
+    config_win_rate_max.position_management.win_rate_max_profile.re_expansion_flow_acceleration = True
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create bars: current price NOT above prev high (price action fails)
+    prev_bar = create_bar(symbol="ETHUSDT", close=100.0)
+    prev_bar.high = 101.0
+    current_bar = create_bar(symbol="ETHUSDT", close=100.5)  # 100.5 < 101.0 (prev_high)
+    current_bar.high = 100.5
+
+    pm.extended_features.bars_windows["ETHUSDT"] = deque([prev_bar, current_bar], maxlen=100)
+
+    # Mock get_bar_return to return negative (micro impulse fails for LONG)
+    pm.extended_features.get_bar_return = lambda symbol: -0.005
+
+    # Mock get_flow_acceleration_bars to return non-increasing (flow acceleration fails)
+    pm.extended_features.get_flow_acceleration_bars = lambda symbol, lookback: [0.60, 0.55, 0.50]
+
+    # Create pending signal (Direction.UP)
+    event = Event(
+        event_id="test_event_6",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_re_expansion(pending, current_bar, features)
+
+    # ASSERT
+    assert result is False, "Should fail when all 3 methods fail (no expansion confirmed)"
+
+
+def test_re_expansion_disabled_always_passes(config_win_rate_max, mock_storage):
+    """Re-expansion passes when require_re_expansion=False."""
+    # ARRANGE
+    config_win_rate_max.position_management.profile = "WIN_RATE_MAX"
+    config_win_rate_max.position_management.win_rate_max_profile.require_re_expansion = False
+    pm = create_position_manager(config_win_rate_max, mock_storage)
+
+    # Create bars with no expansion (would fail if checked)
+    prev_bar = create_bar(symbol="ETHUSDT", close=100.0)
+    prev_bar.high = 101.0
+    current_bar = create_bar(symbol="ETHUSDT", close=99.0)  # Below prev_high
+    current_bar.high = 99.0
+
+    pm.extended_features.bars_windows["ETHUSDT"] = deque([prev_bar, current_bar], maxlen=100)
+
+    # Create pending signal
+    event = Event(
+        event_id="test_event_7",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_re_expansion(pending, current_bar, features)
+
+    # ASSERT
+    assert result is True, "Should pass when require_re_expansion=False (regardless of expansion)"
+
+
+def test_re_expansion_skips_for_default_profile(config_default, mock_storage):
+    """Re-expansion check skipped for DEFAULT profile."""
+    # ARRANGE
+    pm = create_position_manager(config_default, mock_storage)
+
+    # Create bars with no expansion (would fail if checked)
+    prev_bar = create_bar(symbol="ETHUSDT", close=100.0)
+    prev_bar.high = 101.0
+    current_bar = create_bar(symbol="ETHUSDT", close=99.0)
+    current_bar.high = 99.0
+
+    pm.extended_features.bars_windows["ETHUSDT"] = deque([prev_bar, current_bar], maxlen=100)
+
+    # Create pending signal
+    event = Event(
+        event_id="test_event_8",
+        ts=int(datetime.now().timestamp() * 1000),
+        initiator_symbol="ETHUSDT",
+        direction=Direction.UP,
+        status=EventStatus.CONFIRMED
+    )
+    pending = PendingSignal(
+        signal_id="ETHUSDT_test_UP",
+        event=event,
+        created_ts=int(datetime.now().timestamp() * 1000),
+        expires_ts=int((datetime.now().timestamp() + 600) * 1000),
+        direction=Direction.UP,
+        symbol="ETHUSDT",
+        signal_z_er=3.5,
+        signal_z_vol=3.2,
+        signal_price=100.0
+    )
+
+    features = create_features(symbol="ETHUSDT", z_er=2.5)
+
+    # ACT
+    result = pm._check_re_expansion(pending, current_bar, features)
+
+    # ASSERT
+    assert result is True, "Should skip check for DEFAULT profile (always return True)"
