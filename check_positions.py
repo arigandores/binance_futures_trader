@@ -6,25 +6,12 @@ import io
 from datetime import datetime
 from detector.storage import Storage
 from detector.models import PositionStatus
+from detector.utils import format_price
 
 # Fix Windows console encoding for emoji support
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-def format_price(price: float) -> str:
-    """Format price with appropriate decimal places based on magnitude."""
-    if price >= 100:
-        return f"${price:,.2f}"
-    elif price >= 10:
-        return f"${price:,.3f}"
-    elif price >= 1:
-        return f"${price:,.4f}"
-    elif price >= 0.01:
-        return f"${price:,.5f}"
-    elif price >= 0.0001:
-        return f"${price:,.6f}"
-    else:
-        return f"${price:,.8f}"
 
 async def print_positions():
     """Print open and closed positions with PnL stats."""

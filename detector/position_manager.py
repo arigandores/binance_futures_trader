@@ -6,20 +6,7 @@ import aiohttp
 from typing import Dict, Optional
 from datetime import datetime
 
-def format_price(price: float) -> str:
-    """Format price with appropriate decimal places based on magnitude."""
-    if price >= 100:
-        return f"${price:,.2f}"
-    elif price >= 10:
-        return f"${price:,.3f}"
-    elif price >= 1:
-        return f"${price:,.4f}"
-    elif price >= 0.01:
-        return f"${price:,.5f}"
-    elif price >= 0.0001:
-        return f"${price:,.6f}"
-    else:
-        return f"${price:,.8f}"
+from detector.utils import format_price
 from detector.models import (
     Event, Features, Bar, Position, PositionStatus, ExitReason, Direction,
     PendingSignal
@@ -166,82 +153,6 @@ class PositionManager:
 
             except Exception as e:
                 logger.error(f"Error handling bars: {e}")
-
-    async def _check_entry_triggers(
-        self,
-        event: Event,
-        current_bar: Bar,
-        current_features: Optional[Features]
-    ) -> bool:
-        """
-        Check if entry triggers are met (Signal+Trigger separation).
-
-        Entry triggers (if enabled):
-        1. Z-score has cooled from peak (abs(z_ER) in range 2.0-2.5)
-        2. Price has pulled back slightly from recent peak (0.5-1%)
-        3. Taker flow has stabilized (< 10% change over 2-3 bars)
-
-        Returns True if all required triggers met, False otherwise.
-        """
-        cfg = self.config.position_management
-
-        # If triggers disabled, allow immediate entry
-        if not cfg.use_entry_triggers:
-            return True
-
-        symbol = event.initiator_symbol
-        direction = event.direction
-
-        # Need features for z-score check
-        if current_features is None:
-            logger.debug(f"{symbol}: No features available for trigger validation")
-            return False
-
-        # Trigger 1: Z-score cooldown
-        # Signal detected at z_ER >= 3.0, but wait for it to cool to 2.0-2.5 range
-        current_z_er = abs(current_features.z_er_15m)
-
-        if current_z_er > 3.0:
-            # Still at peak, wait for cooldown
-            logger.debug(f"{symbol}: Z-score still at peak ({current_z_er:.2f}), waiting for cooldown")
-            return False
-
-        if current_z_er < cfg.entry_trigger_z_cooldown:
-            # Cooled too much, signal too weak
-            logger.debug(f"{symbol}: Z-score too weak ({current_z_er:.2f} < {cfg.entry_trigger_z_cooldown})")
-            return False
-
-        # Z-score in acceptable range (2.0-2.5 by default)
-        logger.debug(f"{symbol}: Z-score in trigger range ({current_z_er:.2f})")
-
-        # Trigger 2: Price pullback from peak
-        peak_price = self.extended_features.get_recent_price_peak(symbol, direction, lookback_bars=5)
-
-        if peak_price is not None:
-            if direction == Direction.UP:
-                pullback_pct = (peak_price - current_bar.close) / peak_price * 100
-            else:
-                pullback_pct = (current_bar.close - peak_price) / peak_price * 100
-
-            if pullback_pct < cfg.entry_trigger_pullback_pct:
-                logger.debug(f"{symbol}: Insufficient pullback ({pullback_pct:.2f}% < {cfg.entry_trigger_pullback_pct}%)")
-                return False
-
-            logger.debug(f"{symbol}: Pullback sufficient ({pullback_pct:.2f}%)")
-
-        # Trigger 3: Taker flow stability
-        taker_stability = self.extended_features.get_taker_flow_stability(symbol, lookback_bars=3)
-
-        if taker_stability is not None:
-            if taker_stability > cfg.entry_trigger_taker_stability:
-                logger.debug(f"{symbol}: Taker flow unstable (change: {taker_stability:.2f})")
-                return False
-
-            logger.debug(f"{symbol}: Taker flow stable (max change: {taker_stability:.2f})")
-
-        # All triggers met
-        logger.info(f"{symbol}: All entry triggers met - opening position")
-        return True
 
     def _get_pending_lock(self, symbol: str) -> asyncio.Lock:
         """Get or create lock for symbol (Must-Fix #11)."""

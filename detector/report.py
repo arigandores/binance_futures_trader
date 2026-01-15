@@ -6,7 +6,6 @@ from collections import Counter
 from typing import Dict, Any, List
 from detector.storage import Storage
 from detector.utils import parse_timerange, format_timestamp
-from detector.models import EventStatus
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +55,8 @@ class ReportGenerator:
 
     def _build_report(self, events: List, start_ts: int, end_ts: int) -> Dict[str, Any]:
         """Build report dictionary from events."""
-        # Count event types
-        total_initiator = sum(1 for e in events if e.status != EventStatus.SECTOR_DIFFUSION)
-        total_sector = sum(1 for e in events if e.status == EventStatus.SECTOR_DIFFUSION)
-        total_confirmed = sum(1 for e in events if e.status == EventStatus.CONFIRMED)
+        # Count all events (simplified - no status filtering)
+        total_events = len(events)
 
         # Count by symbol
         symbol_counts = Counter(e.initiator_symbol for e in events)
@@ -74,10 +71,7 @@ class ReportGenerator:
         # Build report
         report = {
             'summary': {
-                'total_events': len(events),
-                'total_initiator_events': total_initiator,
-                'total_confirmed': total_confirmed,
-                'total_sector_events': total_sector,
+                'total_events': total_events,
                 'time_range': {
                     'start': format_timestamp(start_ts),
                     'end': format_timestamp(end_ts),
@@ -100,9 +94,6 @@ class ReportGenerator:
         print("=" * 60)
         print(f"Time Range: {summary['time_range']['start']} to {summary['time_range']['end']}")
         print(f"Total Events: {summary['total_events']}")
-        print(f"  - Initiator Events: {summary['total_initiator_events']}")
-        print(f"  - Confirmed Events: {summary['total_confirmed']}")
-        print(f"  - Sector Diffusion Events: {summary['total_sector_events']}")
         print("\nTop Symbols:")
 
         for entry in report['top_symbols'][:5]:

@@ -45,19 +45,6 @@ def setup_logging(log_level: str = "INFO") -> None:
     logger.info("Logging initialized", level=log_level)
 
 
-def align_to_minute(timestamp_ms: int) -> int:
-    """
-    Align timestamp to minute boundary.
-
-    Args:
-        timestamp_ms: Timestamp in milliseconds since epoch
-
-    Returns:
-        Aligned timestamp in milliseconds (floor to minute)
-    """
-    return (timestamp_ms // 60000) * 60000
-
-
 def parse_timerange(timerange: str) -> Tuple[int, int]:
     """
     Parse timerange string (e.g., "24h", "7d") to timestamp range.
@@ -103,23 +90,25 @@ def format_timestamp(timestamp_ms: int) -> str:
     return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
 
 
-def format_duration_ms(duration_ms: int) -> str:
+def format_price(price: float) -> str:
     """
-    Format duration in milliseconds as human-readable string.
+    Format price with appropriate decimal places based on magnitude.
 
     Args:
-        duration_ms: Duration in milliseconds
+        price: Price value to format
 
     Returns:
-        Formatted string (e.g., "2h 15m", "45m", "30s")
+        Formatted price string with $ prefix
     """
-    seconds = duration_ms // 1000
-    minutes = seconds // 60
-    hours = minutes // 60
-
-    if hours > 0:
-        return f"{hours}h {minutes % 60}m"
-    elif minutes > 0:
-        return f"{minutes}m"
+    if price >= 100:
+        return f"${price:,.2f}"
+    elif price >= 10:
+        return f"${price:,.3f}"
+    elif price >= 1:
+        return f"${price:,.4f}"
+    elif price >= 0.01:
+        return f"${price:,.5f}"
+    elif price >= 0.0001:
+        return f"${price:,.6f}"
     else:
-        return f"{seconds}s"
+        return f"${price:,.8f}"

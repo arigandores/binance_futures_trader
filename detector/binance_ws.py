@@ -16,7 +16,7 @@ class BinanceWebSocketClient:
     WebSocket client for Binance USD-M Futures streams.
 
     Handles:
-    - Combined stream subscription (aggTrade, bookTicker, markPrice, forceOrder)
+    - Combined stream subscription (aggTrade, markPrice)
     - Automatic reconnection with exponential backoff
     - Trade ID deduplication
     - Emits ticks to asyncio.Queue
@@ -80,15 +80,6 @@ class BinanceWebSocketClient:
             symbol_lower = symbol.lower()
             streams.append(f"{symbol_lower}@aggTrade")
             streams.append(f"{symbol_lower}@markPrice@1s")
-
-        # Add global bookTicker
-        streams.append("!bookTicker")
-
-        # Try to add forceOrder streams (optional)
-        # Note: forceOrder may not be available or documented
-        for symbol in self.symbols:
-            symbol_lower = symbol.lower()
-            streams.append(f"{symbol_lower}@forceOrder")
 
         stream_string = "/".join(streams)
         return f"{self.BASE_URL}?streams={stream_string}"
@@ -157,12 +148,8 @@ class BinanceWebSocketClient:
         """Detect stream type from stream name."""
         if 'aggTrade' in stream:
             return StreamType.AGG_TRADE
-        elif 'bookTicker' in stream:
-            return StreamType.BOOK_TICKER
         elif 'markPrice' in stream:
             return StreamType.MARK_PRICE
-        elif 'forceOrder' in stream:
-            return StreamType.FORCE_ORDER
         else:
             return None
 

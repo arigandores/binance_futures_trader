@@ -165,13 +165,7 @@ class Backfiller:
                 trades=trades,
                 taker_buy=taker_buy_volume,
                 taker_sell=taker_sell_volume,
-                liq_notional=0.0,  # Not available in klines
-                liq_count=0,
-                mid=None,  # Not available in klines
-                spread_bps=None,
-                mark=None,
-                funding=None,
-                next_funding_ts=None,
+                funding=None,  # Not available in klines, will be populated by markPrice stream
                 oi=None  # Will be populated by OI backfill
             )
 

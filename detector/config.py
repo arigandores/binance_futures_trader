@@ -89,7 +89,6 @@ class ThresholdsConfig:
     excess_return_z_initiator: float = 3.0
     volume_z_initiator: float = 3.0
     taker_dominance_min: float = 0.65
-    oi_delta_z_confirm: float = 2.0
     liquidation_z_confirm: float = 2.0
     funding_abs_threshold: float = 0.0010
     sector_k_min: int = 2

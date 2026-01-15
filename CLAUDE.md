@@ -149,7 +149,7 @@ All position actions (open/close) are automatically sent to Telegram if enabled:
 - 💼 Position closed with PnL and exit reason
 - Real-time updates directly to your phone
 
-See `TELEGRAM_NOTIFICATIONS.md` for detailed examples and setup.
+See `docs/features/TELEGRAM_NOTIFICATIONS.md` for detailed examples and setup.
 
 **Configuration (All Must-Fix Parameters Included):**
 ```yaml
@@ -442,14 +442,17 @@ poetry run python -m detector report --since 24h --output report.json
 
 ### Testing
 ```bash
-# Run all tests
-poetry run pytest tests/ -v
+# Run all unit tests (excludes integration)
+poetry run pytest tests/ -v --ignore=tests/integration
 
 # Run specific test file
 poetry run pytest tests/test_detector_rules.py -v
+
+# Run integration tests (requires database)
+poetry run pytest tests/integration/ -v
 ```
 
-**Test Coverage (33 tests, 100% pass rate):**
+**Test Coverage (75 tests, 100% pass rate):**
 - Bar aggregation from synthetic ticks
 - Robust z-score calculation (MAD-based)
 - Initiator trigger rules (bidirectional)
@@ -583,7 +586,7 @@ alerts:
 
 ## Professional Trading Improvements (2026-01-15) - PRODUCTION-READY ✅
 
-Based on deep research of perpetual futures trading strategies, the following professional-grade improvements have been **fully implemented and tested** (see ENTRY_TRIGGER_FIX_PLAN.md):
+Based on deep research of perpetual futures trading strategies, the following professional-grade improvements have been **fully implemented and tested** (see docs/features/ENTRY_TRIGGER_FIX_PLAN.md):
 
 ### 1. Signal+Trigger Entry Separation (Must-Fix #1-13 Implemented)
 **Problem**: Entering immediately at signal detection often results in poor entry prices (buying at peaks).
@@ -693,8 +696,10 @@ position_management:
 6. ✅ Verify taker_stability units - Uses 0.10 (fraction), not 10.0 (percent)
 
 **Test Coverage:**
-- 21 position manager tests (100% pass rate)
-- 33 total tests (all passing)
+- 21 position manager tests
+- 45 WIN_RATE_MAX filter tests
+- 9 core detector tests
+- 75 total tests (100% pass rate)
 - Entry trigger tests verify: z-cooldown, pullback, stability, dominance
 - Exit tests verify: trailing stops, ATR targets, relaxed thresholds
 - Race condition tests verify: asyncio.Lock, idempotent processing
@@ -717,7 +722,7 @@ Signal (z>=3.0) → Create Pending → Watch Window (check EVERY bar) → Entry 
 
 **Key Principle**: Watch window ≠ Fixed delay. Entry happens at FIRST bar where triggers met.
 
-See `ENTRY_TRIGGER_FIX_PLAN.md` for detailed implementation plan and verification report.
+See `docs/features/ENTRY_TRIGGER_FIX_PLAN.md` for detailed implementation plan and verification report.
 
 ## Important Notes
 
@@ -802,8 +807,8 @@ python check_database.py
 # View position performance (open and closed positions)
 python check_positions.py
 
-# Run all tests to verify implementation
-poetry run pytest tests/ -v
+# Run all unit tests to verify implementation
+poetry run pytest tests/ -v --ignore=tests/integration
 
 # View recent bars
 sqlite3 data/market.db "SELECT * FROM bars_1m ORDER BY ts_open DESC LIMIT 10;"
@@ -851,4 +856,4 @@ Position opened (from pending): BTCUSDT_<ts>_UP_triggered | Trigger delay: 3 bar
 - "Pending signal expired" (50%+ rate) = Triggers too strict, adjust thresholds
 - KeyError crashes = Implementation bug (should NOT happen with Must-Fix #13)
 
-See ENTRY_TRIGGER_FIX_PLAN.md for complete implementation details and troubleshooting.
+See docs/features/ENTRY_TRIGGER_FIX_PLAN.md for complete implementation details and troubleshooting.

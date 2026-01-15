@@ -392,7 +392,6 @@ async def test_position_duration_calculation(position_manager, mock_storage):
     )
 
     assert position.duration_minutes == 45
-    assert position.bars_held == 45
 
 
 @pytest.mark.asyncio

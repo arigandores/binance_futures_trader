@@ -365,7 +365,7 @@ Position actions are automatically sent to Telegram if enabled:
 - 📊 Position opened with entry details
 - 💼 Position closed with PnL and exit reason
 
-See `TELEGRAM_NOTIFICATIONS.md` for examples.
+See `docs/features/TELEGRAM_NOTIFICATIONS.md` for examples.
 
 ### Trading Profiles
 
@@ -486,10 +486,9 @@ BinanceAlertManager/
 ├── config.example.yaml      # Configuration template
 ├── README.md                # This file
 ├── CLAUDE.md                # Claude Code development guide
-├── DOCKER.md                # Docker usage documentation (NEW)
-├── Dockerfile               # Multi-stage Docker build (NEW)
-├── docker-compose.yml       # Docker Compose orchestration (NEW)
-├── .dockerignore            # Docker build optimization (NEW)
+├── DOCKER.md                # Docker deployment guide
+├── Dockerfile               # Multi-stage Docker build
+├── docker-compose.yml       # Docker Compose orchestration
 ├── check_positions.py       # Position reporting script
 ├── check_database.py        # Database diagnostics script
 ├── detector/
@@ -501,21 +500,23 @@ BinanceAlertManager/
 │   ├── binance_rest.py      # REST API client
 │   ├── aggregator.py        # Tick-to-bar aggregation
 │   ├── features.py          # Feature calculation
-│   ├── features_extended.py # Extended features (ATR, pullback, etc.) - NEW
+│   ├── features_extended.py # Extended features (ATR, pullback, etc.)
 │   ├── detector.py          # Anomaly detection
-│   ├── position_manager.py  # Virtual position management - NEW
+│   ├── position_manager.py  # Virtual position management
 │   ├── storage.py           # SQLite persistence
 │   ├── alerts.py            # Alert dispatching
 │   ├── report.py            # Report generation
 │   ├── backfill.py          # Historical data fetching
 │   └── utils.py             # Utilities
 ├── tests/
-│   ├── test_aggregator.py
-│   ├── test_features.py
-│   ├── test_detector_rules.py
-│   ├── test_cooldown.py
-│   ├── test_sector_diffusion.py
-│   └── test_position_manager.py  # 21 position management tests - NEW
+│   ├── test_*.py            # Unit tests
+│   └── integration/         # Integration tests (run separately)
+├── docs/
+│   ├── QUICKSTART.md        # Quick start guide
+│   ├── QUICK_REFERENCE.md   # Command reference
+│   ├── features/            # Feature documentation
+│   ├── development/         # Research & implementation plans
+│   └── archive/             # Historical bug fixes
 └── data/
     └── market.db            # SQLite database (created on first run)
 ```

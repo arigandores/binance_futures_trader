@@ -16,9 +16,7 @@ class BarAggregator:
     Handles:
     - OHLCV aggregation from aggTrade
     - Taker buy/sell split tracking
-    - Mid price and spread from bookTicker
-    - Mark price and funding from markPrice
-    - Liquidations from forceOrder (if available)
+    - Funding rate from markPrice stream
     - Minute boundary detection and bar closing
     """
 
@@ -125,12 +123,8 @@ class BarAggregator:
         """Update current bar based on tick data."""
         if stream_type == StreamType.AGG_TRADE:
             self._update_from_agg_trade(data)
-        elif stream_type == StreamType.BOOK_TICKER:
-            self._update_from_book_ticker(data)
         elif stream_type == StreamType.MARK_PRICE:
             self._update_from_mark_price(data)
-        elif stream_type == StreamType.FORCE_ORDER:
-            self._update_from_force_order(data)
 
     def _update_from_agg_trade(self, data: Dict) -> None:
         """Update bar from aggTrade data."""
@@ -171,50 +165,20 @@ class BarAggregator:
             # Buyer is the taker (aggressive buyer)
             bar.taker_buy += qty
 
-    def _update_from_book_ticker(self, data: Dict) -> None:
-        """Update bar from bookTicker data."""
-        symbol = data.get('s')
-        if not symbol or symbol not in self.symbols_set:
-            return
-
-        best_bid = float(data.get('b', 0))
-        best_ask = float(data.get('a', 0))
-
-        if best_bid <= 0 or best_ask <= 0:
-            return
-
-        mid = (best_bid + best_ask) / 2
-        spread_bps = (best_ask - best_bid) / mid * 10000
-
-        # Get or create bar
-        bar = self.current_bars.get(symbol)
-        if not bar:
-            bar = Bar(symbol=symbol, ts_minute=0)
-            # Initialize OHLC from mid price if this is the first data for this bar
-            bar.open = mid
-            bar.high = mid
-            bar.low = mid
-            bar.close = mid
-            self.current_bars[symbol] = bar
-
-        bar.mid = mid
-        bar.spread_bps = spread_bps
-
     def _update_from_mark_price(self, data: Dict) -> None:
         """Update bar from markPrice data."""
         symbol = data.get('s')
         if not symbol or symbol not in self.symbols_set:
             return
 
-        mark_price = float(data.get('p', 0))
         funding_rate = float(data.get('r', 0))
-        next_funding_time = int(data.get('T', 0))
 
         # Get or create bar
         bar = self.current_bars.get(symbol)
         if not bar:
             bar = Bar(symbol=symbol, ts_minute=0)
             # Initialize OHLC from mark price if this is the first data for this bar
+            mark_price = float(data.get('p', 0))
             if mark_price > 0:
                 bar.open = mark_price
                 bar.high = mark_price
@@ -222,34 +186,4 @@ class BarAggregator:
                 bar.close = mark_price
             self.current_bars[symbol] = bar
 
-        bar.mark = mark_price
         bar.funding = funding_rate
-        bar.next_funding_ts = next_funding_time
-
-    def _update_from_force_order(self, data: Dict) -> None:
-        """Update bar from forceOrder data (liquidations)."""
-        # Note: forceOrder stream is optional and may not be available
-        symbol = data.get('s')
-        if not symbol or symbol not in self.symbols_set:
-            return
-
-        price = float(data.get('p', 0))
-        qty = float(data.get('q', 0))
-
-        if price <= 0 or qty <= 0:
-            return
-
-        # Get or create bar
-        bar = self.current_bars.get(symbol)
-        if not bar:
-            bar = Bar(symbol=symbol, ts_minute=0)
-            # Initialize OHLC from liquidation price if this is the first data for this bar
-            bar.open = price
-            bar.high = price
-            bar.low = price
-            bar.close = price
-            self.current_bars[symbol] = bar
-
-        # Accumulate liquidation notional
-        bar.liq_notional += abs(price * qty)
-        bar.liq_count += 1

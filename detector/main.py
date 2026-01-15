@@ -194,7 +194,7 @@ class SectorShotDetector:
             logger.info("OI backfill complete!")
         except Exception as e:
             logger.error(f"OI backfill failed: {e}")
-            logger.warning("Continuing without OI data. Events will have z_oi_delta_1h = None")
+            logger.warning("Continuing without OI data")
 
     async def run(self) -> None:
         """Main entry point - start all components."""
@@ -270,7 +270,7 @@ class SectorShotDetector:
                     "tick_q": self.tick_queue.qsize(),
                     "bar_q": self.bar_queue.qsize(),
                     "feature_q": self.feature_queue.qsize(),
-                    "event_q": self.event_queue.qsize(),
+                    "event_q_pm": self.event_queue_pm.qsize(),
                     "ws_connected": self.ws_client.is_connected
                 }
 

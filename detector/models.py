@@ -8,9 +8,7 @@ from enum import Enum
 class StreamType(str, Enum):
     """WebSocket stream types."""
     AGG_TRADE = "aggTrade"
-    BOOK_TICKER = "bookTicker"
     MARK_PRICE = "markPrice"
-    FORCE_ORDER = "forceOrder"
 
 
 class Direction(str, Enum):
@@ -55,18 +53,8 @@ class Bar:
     taker_buy: float = 0.0
     taker_sell: float = 0.0
 
-    # Liquidations (if available)
-    liq_notional: float = 0.0
-    liq_count: int = 0
-
-    # Book data
-    mid: Optional[float] = None
-    spread_bps: Optional[float] = None
-
-    # Mark price and funding
-    mark: Optional[float] = None
+    # Funding rate (from markPrice stream, None during backfill)
     funding: Optional[float] = None
-    next_funding_ts: Optional[int] = None
 
     # Open Interest
     oi: Optional[float] = None
@@ -101,11 +89,7 @@ class Features:
     vol_15m: float = 0.0  # Sum of volume over last 15 bars
     taker_buy_share_15m: Optional[float] = None
 
-    # Confirmation metrics (optional, depends on API key)
-    oi_delta_1h: Optional[float] = None
-    z_oi_delta_1h: Optional[float] = None
-    liq_15m: Optional[float] = None
-    z_liq_15m: Optional[float] = None
+    # Funding rate (from markPrice stream)
     funding_rate: Optional[float] = None
 
     # Direction
@@ -270,13 +254,11 @@ class Position:
 
     # PnL metrics
     pnl_percent: Optional[float] = None  # (close - open) / open * 100 * direction_multiplier
-    pnl_ticks: Optional[float] = None  # Absolute price difference
     max_favorable_excursion: float = 0.0  # Best profit seen during position
     max_adverse_excursion: float = 0.0  # Worst drawdown seen during position
 
     # Duration
     duration_minutes: Optional[int] = None
-    bars_held: Optional[int] = None
 
     # WIN_RATE_MAX profile: Partial profit tracking
     partial_profit_executed: bool = False
@@ -319,11 +301,9 @@ class Position:
         # Calculate PnL
         direction_multiplier = 1 if self.direction == Direction.UP else -1
         self.pnl_percent = ((close_price - self.open_price) / self.open_price * 100) * direction_multiplier
-        self.pnl_ticks = (close_price - self.open_price) * direction_multiplier
 
         # Calculate duration
         self.duration_minutes = (close_ts - self.open_ts) // (60 * 1000)
-        self.bars_held = self.duration_minutes  # 1-minute bars
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -339,7 +319,6 @@ class Position:
             'close_ts': self.close_ts,
             'exit_reason': self.exit_reason.value if self.exit_reason else None,
             'pnl_percent': self.pnl_percent,
-            'pnl_ticks': self.pnl_ticks,
             'duration_minutes': self.duration_minutes,
             'mfe': self.max_favorable_excursion,
             'mae': self.max_adverse_excursion,

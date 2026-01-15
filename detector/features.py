@@ -28,13 +28,6 @@ class RollingWindow:
         self.taker_buys = deque(maxlen=maxlen)
         self.taker_sells = deque(maxlen=maxlen)
 
-        # Liquidations (if available)
-        self.liq_notionals = deque(maxlen=maxlen)
-
-        # Open Interest
-        self.ois = deque(maxlen=maxlen)  # Raw OI values
-        self.oi_deltas = deque(maxlen=maxlen)  # OI delta_1h values
-
         # Derived features
         self.returns_1m = deque(maxlen=maxlen)
         self.excess_returns = deque(maxlen=maxlen)
@@ -45,9 +38,6 @@ class RollingWindow:
         self.volumes.append(bar.volume)
         self.taker_buys.append(bar.taker_buy)
         self.taker_sells.append(bar.taker_sell)
-        self.liq_notionals.append(bar.liq_notional)
-        # Append OI (None if not available)
-        self.ois.append(bar.oi if bar.oi is not None else None)
 
     def is_ready(self, min_bars: int = 15) -> bool:
         """Check if window has enough data."""
@@ -175,23 +165,6 @@ class FeatureCalculator:
                 # Taker buy share
                 taker_buy_share_15m = self._calculate_taker_share_at_index(extended_window, i, lookback=15)
 
-                # OI delta (if available)
-                oi_delta_1h = None
-                z_oi_delta_1h = None
-                if i >= 60 and len(extended_window.ois) > i:
-                    oi_current = list(extended_window.ois)[i]
-                    oi_1h_ago = list(extended_window.ois)[i - 60]
-                    if oi_current is not None and oi_1h_ago is not None:
-                        oi_delta_1h = oi_current - oi_1h_ago
-                        extended_window.oi_deltas.append(oi_delta_1h)
-
-                        if len(extended_window.oi_deltas) >= 60:
-                            z_oi_delta_1h = self._robust_zscore(list(extended_window.oi_deltas))
-
-                # Liquidation sum
-                liq_15m = sum(list(extended_window.liq_notionals)[max(0, i-14):i+1])
-                z_liq_15m = self._robust_zscore(list(extended_window.liq_notionals)[:i+1]) if liq_15m > 0 else 0
-
                 # Create features object
                 features = Features(
                     symbol=symbol,
@@ -204,10 +177,6 @@ class FeatureCalculator:
                     vol_15m=vol_15m,
                     z_vol_15m=z_vol_15m,
                     taker_buy_share_15m=taker_buy_share_15m,
-                    oi_delta_1h=oi_delta_1h,
-                    z_oi_delta_1h=z_oi_delta_1h,
-                    liq_15m=liq_15m,
-                    z_liq_15m=z_liq_15m,
                     funding_rate=bar.funding
                 )
 
@@ -221,7 +190,7 @@ class FeatureCalculator:
                 total_features_written += len(features_batch)
                 logger.info(f"Wrote {len(features_batch)} features for {symbol}")
 
-        # Now populate the actual rolling windows with pre-calculated excess returns and OI deltas
+        # Now populate the actual rolling windows with pre-calculated excess returns
         logger.info("Populating rolling windows with pre-calculated data...")
 
         for symbol in self.config.universe.all_symbols:
@@ -231,14 +200,10 @@ class FeatureCalculator:
             if not extended_window or not window:
                 continue
 
-            # Copy last 720 excess returns and OI deltas to the actual rolling window
+            # Copy last 720 excess returns to the actual rolling window
             if len(extended_window.excess_returns) > 0:
                 for er in list(extended_window.excess_returns)[-720:]:
                     window.excess_returns.append(er)
-
-            if len(extended_window.oi_deltas) > 0:
-                for oi_delta in list(extended_window.oi_deltas)[-720:]:
-                    window.oi_deltas.append(oi_delta)
 
         logger.info(f"Backfill complete: {total_features_written} features written to database for {len(self.windows)} symbols")
 
@@ -323,25 +288,6 @@ class FeatureCalculator:
         # Taker buy share (over last 15 bars)
         taker_buy_share_15m = self._calculate_taker_share(window, lookback=15)
 
-        # OI delta and z-score calculation
-        oi_delta_1h = self._calculate_oi_delta_1h(window)
-        z_oi_delta_1h = None
-
-        if oi_delta_1h is not None:
-            window.oi_deltas.append(oi_delta_1h)
-
-            # Calculate z-score if sufficient history (60+ deltas)
-            if len(window.oi_deltas) >= 60:
-                z_oi_delta_1h = self._robust_zscore(list(window.oi_deltas))
-            else:
-                z_oi_delta_1h = 0.0  # Not enough history yet
-        else:
-            window.oi_deltas.append(None)  # Maintain alignment
-
-        # Liquidation sum over last 15 bars
-        liq_15m = sum(list(window.liq_notionals)[-15:]) if len(window.liq_notionals) >= 15 else 0
-        z_liq_15m = self._robust_zscore(list(window.liq_notionals)) if liq_15m > 0 else 0
-
         # Funding rate (from bar)
         funding_rate = bar.funding
 
@@ -357,10 +303,6 @@ class FeatureCalculator:
             vol_15m=vol_15m,
             z_vol_15m=z_vol_15m,
             taker_buy_share_15m=taker_buy_share_15m,
-            oi_delta_1h=oi_delta_1h,
-            z_oi_delta_1h=z_oi_delta_1h,
-            liq_15m=liq_15m,
-            z_liq_15m=z_liq_15m,
             funding_rate=funding_rate
         )
 
@@ -629,25 +571,3 @@ class FeatureCalculator:
 
         except Exception:
             return 0.0
-
-    def _calculate_oi_delta_1h(self, window: RollingWindow) -> Optional[float]:
-        """
-        Calculate OI delta over last 1 hour (60 bars).
-
-        Returns:
-            OI delta (current OI - OI from 60 bars ago), or None if insufficient data
-        """
-        if len(window.ois) < 61:  # Need at least 61 bars (current + 60 back)
-            return None
-
-        # Get current and 1h ago OI values
-        oi_current = window.ois[-1]
-        oi_1h_ago = window.ois[-61]  # 60 bars back (index -61 because -1 is current)
-
-        # Check if both values are available
-        if oi_current is None or oi_1h_ago is None:
-            return None
-
-        # Calculate delta
-        delta = oi_current - oi_1h_ago
-        return delta

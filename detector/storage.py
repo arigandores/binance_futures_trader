@@ -54,9 +54,7 @@ class Storage:
                 o REAL, h REAL, l REAL, c REAL,
                 vol REAL, notional REAL, trades INTEGER,
                 taker_buy REAL, taker_sell REAL,
-                liq_notional REAL, liq_count INTEGER,
-                mid REAL, spread_bps REAL,
-                mark REAL, funding REAL, next_funding_ts INTEGER,
+                funding REAL,
                 oi REAL,
                 PRIMARY KEY (symbol, ts_minute)
             )
@@ -70,8 +68,6 @@ class Storage:
                 er_15m REAL, z_er_15m REAL,
                 vol_15m REAL, z_vol_15m REAL,
                 taker_buy_share_15m REAL,
-                oi_delta_1h REAL, z_oi_delta_1h REAL,
-                liq_15m REAL, z_liq_15m REAL,
                 beta REAL,
                 PRIMARY KEY (symbol, ts_minute)
             )
@@ -119,12 +115,10 @@ class Storage:
                 exit_reason TEXT,
 
                 pnl_percent REAL,
-                pnl_ticks REAL,
                 max_favorable_excursion REAL,
                 max_adverse_excursion REAL,
 
                 duration_minutes INTEGER,
-                bars_held INTEGER,
                 metrics_json TEXT,
 
                 FOREIGN KEY (event_id) REFERENCES events(event_id)
@@ -223,9 +217,7 @@ class Storage:
                 bar.open, bar.high, bar.low, bar.close,
                 bar.volume, bar.notional, bar.trades,
                 bar.taker_buy, bar.taker_sell,
-                bar.liq_notional, bar.liq_count,
-                bar.mid, bar.spread_bps,
-                bar.mark, bar.funding, bar.next_funding_ts,
+                bar.funding,
                 bar.oi
             )
             for bar in self.bars_buffer
@@ -237,11 +229,9 @@ class Storage:
                 o, h, l, c,
                 vol, notional, trades,
                 taker_buy, taker_sell,
-                liq_notional, liq_count,
-                mid, spread_bps,
-                mark, funding, next_funding_ts,
+                funding,
                 oi
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, bars_data)
 
         self.bars_buffer.clear()
@@ -257,8 +247,6 @@ class Storage:
                 f.er_15m, f.z_er_15m,
                 f.vol_15m, f.z_vol_15m,
                 f.taker_buy_share_15m,
-                f.oi_delta_1h, f.z_oi_delta_1h,
-                f.liq_15m, f.z_liq_15m,
                 f.beta
             )
             for f in self.features_buffer
@@ -270,10 +258,8 @@ class Storage:
                 er_15m, z_er_15m,
                 vol_15m, z_vol_15m,
                 taker_buy_share_15m,
-                oi_delta_1h, z_oi_delta_1h,
-                liq_15m, z_liq_15m,
                 beta
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, features_data)
 
         self.features_buffer.clear()
@@ -310,8 +296,7 @@ class Storage:
         try:
             async with self.db.execute("""
                 SELECT symbol, ts_minute, o, h, l, c, vol, notional, trades,
-                       taker_buy, taker_sell, liq_notional, liq_count,
-                       mid, spread_bps, mark, funding, next_funding_ts, oi
+                       taker_buy, taker_sell, funding, oi
                 FROM bars_1m
                 WHERE symbol = ?
                 ORDER BY ts_minute DESC
@@ -334,14 +319,8 @@ class Storage:
                     trades=row[8],
                     taker_buy=row[9],
                     taker_sell=row[10],
-                    liq_notional=row[11],
-                    liq_count=row[12],
-                    mid=row[13],
-                    spread_bps=row[14],
-                    mark=row[15],
-                    funding=row[16],
-                    next_funding_ts=row[17],
-                    oi=row[18]
+                    funding=row[11],
+                    oi=row[12]
                 )
                 bars.append(bar)
 
@@ -476,9 +455,9 @@ class Storage:
                     position_id, event_id, symbol, direction, status,
                     open_price, open_ts, entry_z_er, entry_z_vol, entry_taker_share,
                     close_price, close_ts, exit_z_er, exit_z_vol, exit_reason,
-                    pnl_percent, pnl_ticks, max_favorable_excursion, max_adverse_excursion,
-                    duration_minutes, bars_held, metrics_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pnl_percent, max_favorable_excursion, max_adverse_excursion,
+                    duration_minutes, metrics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position.position_id,
                 position.event_id,
@@ -496,11 +475,9 @@ class Storage:
                 position.exit_z_vol,
                 position.exit_reason.value if position.exit_reason else None,
                 position.pnl_percent,
-                position.pnl_ticks,
                 position.max_favorable_excursion,
                 position.max_adverse_excursion,
                 position.duration_minutes,
-                position.bars_held,
                 json.dumps(position.metrics)
             ))
             await self.db.commit()
@@ -612,12 +589,10 @@ class Storage:
             exit_z_vol=row[13],
             exit_reason=ExitReason(row[14]) if row[14] else None,
             pnl_percent=row[15],
-            pnl_ticks=row[16],
-            max_favorable_excursion=row[17] or 0.0,
-            max_adverse_excursion=row[18] or 0.0,
-            duration_minutes=row[19],
-            bars_held=row[20],
-            metrics=json.loads(row[21]) if row[21] else {}
+            max_favorable_excursion=row[16] or 0.0,
+            max_adverse_excursion=row[17] or 0.0,
+            duration_minutes=row[18],
+            metrics=json.loads(row[19]) if row[19] else {}
         )
 
     async def write_alert(
