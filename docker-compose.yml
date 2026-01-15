@@ -1,8 +1,6 @@
 # docker-compose.yml for Binance Sector Shot Detector
 # Production-ready orchestration with volume persistence
 
-version: '3.8'
-
 services:
   detector:
     build:

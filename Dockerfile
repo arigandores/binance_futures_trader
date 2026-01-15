@@ -5,7 +5,7 @@
 # =============================================================================
 # Stage 1: Builder - Install dependencies with Poetry
 # =============================================================================
-FROM python:3.12-slim as builder
+FROM python:3.12-slim AS builder
 
 # Environment variables for Poetry and Python optimization
 ENV POETRY_VERSION=1.8.2 \
@@ -38,7 +38,7 @@ RUN poetry install --only-root
 # =============================================================================
 # Stage 2: Runtime - Minimal production image
 # =============================================================================
-FROM python:3.12-slim as runtime
+FROM python:3.12-slim AS runtime
 
 # Python optimization environment variables
 ENV PYTHONUNBUFFERED=1 \

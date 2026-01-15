@@ -28,7 +28,7 @@ share/python-wheels/
 MANIFEST
 
 # Poetry
-poetry.lock
+# NOTE: poetry.lock should be committed for reproducible Docker builds
 .venv/
 env/
 venv/
