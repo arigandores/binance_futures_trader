@@ -179,13 +179,18 @@ class WinRateMaxProfileConfig:
     # Market regime gating (NEW)
     btc_anomaly_filter: bool = True
     btc_anomaly_lookback_minutes: int = 15
+
+    # Symbol quality filter
+    symbol_quality_filter: bool = True
     symbol_blacklist: List[str] = field(default_factory=list)
+    min_volume_usd: float = 100000.0  # Minimum 1m volume in USD
+    min_trades_per_bar: int = 50  # Minimum trades per 1m bar
 
     # Beta quality filter (optional)
     beta_quality_filter: bool = False
     beta_min_r_squared: float = 0.2
-    beta_min_value: float = 0.1
-    beta_max_value: float = 3.0
+    beta_min_abs: float = 0.1  # Renamed from beta_min_value for clarity
+    beta_max_abs: float = 3.0  # Renamed from beta_max_value for clarity
 
 
 @dataclass
