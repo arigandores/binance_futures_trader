@@ -1,4 +1,4 @@
-"""Main CLI orchestrator for the Sector Shot Detector."""
+"""Main CLI orchestrator for the Binance Anomaly Detector."""
 
 import asyncio
 import click
@@ -18,9 +18,9 @@ from detector.utils import setup_logging
 logger = structlog.get_logger()
 
 
-class SectorShotDetector:
+class AnomalyDetectorOrchestrator:
     """
-    Main orchestrator for the Sector Shot Detector.
+    Main orchestrator for the Binance Anomaly Detector.
 
     Coordinates all components:
     - WebSocket client
@@ -159,8 +159,12 @@ class SectorShotDetector:
         try:
             backfiller = Backfiller(self.rest_client, self.storage)
 
-            # Step 1: Backfill klines
-            await backfiller.backfill_symbols(self.config.universe.all_symbols, hours=hours_needed)
+            # Step 1: Backfill klines (BTC first for beta calculations)
+            await backfiller.backfill_symbols(
+                self.config.universe.all_symbols,
+                hours=hours_needed,
+                benchmark_symbol=self.config.universe.benchmark_symbol
+            )
             logger.info("Klines backfill complete!")
 
             # Step 2: Backfill OI data
@@ -198,7 +202,7 @@ class SectorShotDetector:
 
     async def run(self) -> None:
         """Main entry point - start all components."""
-        logger.info("Starting Sector Shot Detector...")
+        logger.info("Starting Anomaly Detector...")
 
         # Initialize database
         await self.storage.init_db()
@@ -289,7 +293,7 @@ class SectorShotDetector:
 
 @click.group()
 def cli():
-    """Binance Sector Shot Detector - Real-time anomaly detection for coordinated sector movements."""
+    """Binance Anomaly Detector - Real-time anomaly detection for futures markets."""
     pass
 
 
@@ -308,7 +312,7 @@ def run(config: str, skip_backfill: bool):
         logger.info("Configuration loaded", config_path=config)
 
         # Run detector
-        detector = SectorShotDetector(cfg)
+        detector = AnomalyDetectorOrchestrator(cfg)
         detector.skip_backfill = skip_backfill
         asyncio.run(detector.run())
 

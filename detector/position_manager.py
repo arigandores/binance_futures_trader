@@ -960,7 +960,7 @@ class PositionManager:
         BTC anomaly is defined as: abs(z_ER) >= 3.0 AND z_VOL >= 3.0
         (same rules as initiator signal detection).
 
-        This is a NO_SECTOR filter - single-symbol only, no sector dependencies.
+        This is a single-symbol filter - no cross-symbol dependencies.
 
         Args:
             symbol: The symbol being evaluated for entry
@@ -1017,7 +1017,7 @@ class PositionManager:
         2. Minimum volume (notional) threshold met
         3. Minimum trades per bar threshold met (if available)
 
-        This is a NO_SECTOR filter - single-symbol only, no sector dependencies.
+        This is a single-symbol filter - no cross-symbol dependencies.
 
         Args:
             symbol: The symbol being evaluated for entry
@@ -1085,7 +1085,7 @@ class PositionManager:
         1. Beta is within reasonable range [beta_min_abs, beta_max_abs]
         2. R-squared check (future enhancement when metric available)
 
-        This is a NO_SECTOR filter - single-symbol only, no sector dependencies.
+        This is a single-symbol filter - no cross-symbol dependencies.
 
         Args:
             symbol: The symbol being evaluated for entry

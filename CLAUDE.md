@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Binance Sector Shot Detector** - Real-time anomaly detection system for coordinated sector movements on Binance USD-M Perpetual Futures.
+**Binance Anomaly Detector** - Real-time anomaly detection system for Binance USD-M Perpetual Futures.
 
-The detector monitors futures markets for "sector shot" anomalies - coordinated price movements across correlated assets (e.g., privacy coins: ZEC, DASH, XMR). It ingests WebSocket streams, aggregates to 1-minute bars, calculates rolling z-scores and beta vs BTC, and alerts when strict trigger rules are met.
+The detector monitors configured futures symbols for statistical anomalies - significant price movements relative to BTC benchmark. It ingests WebSocket streams, aggregates to 1-minute bars, calculates rolling z-scores and beta vs BTC, and alerts when strict trigger rules are met.
 
 **Key Technologies:**
 - Python 3.12+
@@ -379,7 +379,7 @@ position_management:
 - Integration tests: 3 tests
 
 **Confirmations:**
-- NO_SECTOR dependencies (all checks single-symbol)
+- All checks are single-symbol (no cross-symbol dependencies)
 - Re-expansion evaluated per bar (non-latching)
 - Invalidation precedence preserved (strict priority order)
 - DEFAULT profile unchanged (complete backward compatibility)
@@ -457,7 +457,6 @@ poetry run pytest tests/integration/ -v
 - Robust z-score calculation (MAD-based)
 - Initiator trigger rules (bidirectional)
 - Cooldown logic (direction-aware)
-- Sector diffusion detection
 - Position management (21 tests):
   - Entry/exit logic with pending signals queue
   - PnL calculation (long/short)
@@ -502,7 +501,6 @@ WS Streams → Aggregator (1m bars) → Features (z-scores, beta) → Detector (
 
 **detector/detector.py** - Anomaly detection:
 - Initiator rules (abs(z_ER) >= 3.0, z_VOL >= 3.0, extreme taker share)
-- Sector diffusion tracking (2+ followers within 2h)
 - Direction-aware cooldown (60m same direction, 15m opposite)
 
 **detector/storage.py** - SQLite persistence with WAL mode, batched writes
@@ -544,12 +542,6 @@ Direction: UP if z_ER > 0, DOWN if z_ER < 0
 - PARTIAL: 1 confirmation
 - UNCONFIRMED: No confirmations (or no API key)
 
-**Sector Diffusion** (triggers after initiator):
-- 2+ followers with abs(z_ER) >= 2.0 AND z_VOL >= 2.0
-- Same direction as initiator
-- Within 2 hours after initiator
-- Sector share >= 40%
-
 **Cooldown:**
 - Same direction: 60 minutes
 - Opposite direction: 15 minutes (grace period)
@@ -560,15 +552,21 @@ Direction: UP if z_ER > 0, DOWN if z_ER < 0
 
 **features** - Calculated features (z-scores, beta, excess returns)
 
-**events** - Detected anomaly events (initiators, followers)
+**events** - Detected anomaly events (initiators)
 
 **alerts** - Alert history with cooldown tracking
 
-**sector_diffusion** - Sector event tracking
+**positions** - Virtual position tracking and PnL
 
 ### Key Configuration Parameters
 
 ```yaml
+universe:
+  benchmark_symbol: "BTCUSDT"
+  symbols:                               # List of symbols to monitor
+    - "ETHUSDT"
+    - "SOLUSDT"
+
 windows:
   zscore_lookback_bars: 720  # 12 hours for stable z-scores
   beta_lookback_bars: 240     # 4 hours for beta calculation
@@ -577,7 +575,6 @@ thresholds:
   excess_return_z_initiator: 3.0  # Z-score threshold for ER
   volume_z_initiator: 3.0         # Z-score threshold for volume
   taker_dominance_min: 0.65       # Taker buy share (or 0.35 for sells)
-  sector_k_min: 2                 # Minimum followers for sector event
 
 alerts:
   cooldown_minutes_per_symbol: 60        # Same direction cooldown
@@ -738,11 +735,7 @@ The following critical bugs were identified and fixed:
    - Used z_er >= 3.0 instead of abs(z_er) >= 3.0
    - Fixed to detect both bullish and bearish anomalies
 
-3. **Sector Diffusion Broken for Downward Moves** (detector/detector.py:223)
-   - Same issue as #2, followers only detected for upward moves
-   - Fixed to use abs(z_er) >= 2.0
-
-4. **Z-Scores Always 0.00 After Backfill** (detector/features.py)
+3. **Z-Scores Always 0.00 After Backfill** (detector/features.py)
    - Historical bars loaded but excess returns not pre-calculated
    - Fixed by adding two-pass backfill (bars first, then excess returns)
 
@@ -760,7 +753,6 @@ The following critical bugs were identified and fixed:
 
 3. **Bidirectional Detection**
    - Detects both bullish (z_ER > 0) and bearish (z_ER < 0) anomalies
-   - Sector diffusion works in both directions
 
 4. **Entry Trigger Logic Fixed (2026-01-15)** - PRODUCTION-READY
    - All 13 Must-Fix critical issues resolved

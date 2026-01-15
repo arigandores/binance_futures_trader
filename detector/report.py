@@ -90,7 +90,7 @@ class ReportGenerator:
         summary = report['summary']
 
         print("\n" + "=" * 60)
-        print("SECTOR SHOT DETECTOR - REPORT SUMMARY")
+        print("ANOMALY DETECTOR - REPORT SUMMARY")
         print("=" * 60)
         print(f"Time Range: {summary['time_range']['start']} to {summary['time_range']['end']}")
         print(f"Total Events: {summary['total_events']}")

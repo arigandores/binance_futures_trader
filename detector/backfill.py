@@ -1,9 +1,11 @@
-"""Backfill historical data from Binance REST API."""
+"""Backfill historical data from Binance REST API with parallel fetching."""
 
 import asyncio
 import logging
-from typing import List, Dict
+import time
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from detector.models import Bar
 from detector.storage import Storage
 from detector.binance_rest import BinanceRestClient
@@ -11,59 +13,165 @@ from detector.binance_rest import BinanceRestClient
 logger = logging.getLogger(__name__)
 
 
-class Backfiller:
-    """Backfills historical klines data into the database."""
+@dataclass
+class BackfillResult:
+    """Result of backfilling a single symbol."""
+    symbol: str
+    bars_count: int
+    success: bool
+    error: Optional[str] = None
 
-    def __init__(self, rest_client: BinanceRestClient, storage: Storage):
+
+class Backfiller:
+    """
+    Backfills historical klines data into the database.
+
+    Optimized for parallel fetching with rate limiting:
+    - Uses asyncio.Semaphore for concurrent request control
+    - Respects Binance rate limits (2400 weight/min)
+    - Klines with limit=1000 = 5 weight, so ~480 requests/min max
+    - Default: 50 concurrent requests (conservative, ~250 weight/sec max)
+    """
+
+    # Rate limiting configuration
+    DEFAULT_MAX_CONCURRENT = 50  # Max concurrent API requests
+    DEFAULT_BATCH_SIZE = 20  # Symbols per DB flush batch
+
+    # Binance API limits
+    MAX_KLINES_PER_REQUEST = 1500  # Binance max limit
+    KLINES_WEIGHT_1000 = 5  # Weight for limit=1000
+    MAX_WEIGHT_PER_MINUTE = 2400
+
+    def __init__(
+        self,
+        rest_client: BinanceRestClient,
+        storage: Storage,
+        max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    ):
         self.rest_client = rest_client
         self.storage = storage
+        self.max_concurrent = max_concurrent
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._progress_lock = asyncio.Lock()
+        self._total_bars = 0
+        self._completed_symbols = 0
 
-    async def backfill_symbols(self, symbols: List[str], hours: int = 13) -> None:
+    async def backfill_symbols(
+        self,
+        symbols: List[str],
+        hours: int = 13,
+        benchmark_symbol: str = "BTCUSDT"
+    ) -> None:
         """
-        Backfill historical data for all symbols.
+        Backfill historical data for all symbols in PARALLEL.
+
+        BTC (benchmark) is loaded FIRST to ensure it's available for beta/excess return calculations.
 
         Args:
             symbols: List of symbols to backfill
             hours: Number of hours to backfill (default 13 to ensure 720+ bars)
+            benchmark_symbol: Symbol to load first (default BTCUSDT)
         """
-        logger.info(f"Starting backfill for {len(symbols)} symbols, {hours} hours of data")
+        start_time_wall = time.time()
+
+        print(f"Starting backfill for {len(symbols)} symbols, {hours} hours of data")
 
         # Calculate start time
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(hours=hours)
         start_time_ms = int(start_time.timestamp() * 1000)
 
-        logger.info(f"Backfill range: {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"Backfill range: {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-        total_bars = 0
+        # Initialize semaphore for rate limiting
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._total_bars = 0
+        self._completed_symbols = 0
+
+        # STEP 1: Load benchmark (BTC) FIRST - required for beta calculations
+        if benchmark_symbol in symbols:
+            print(f"Loading benchmark {benchmark_symbol} first...")
+            btc_result = await self._fetch_and_store_symbol(
+                benchmark_symbol, start_time_ms, hours, len(symbols)
+            )
+            if btc_result.success:
+                print(f"Benchmark {benchmark_symbol} loaded: {btc_result.bars_count} bars")
+                await self.storage.flush_all()
+            else:
+                logger.error(f"Failed to load benchmark {benchmark_symbol}: {btc_result.error}")
+
+        # STEP 2: Load remaining symbols in parallel
+        other_symbols = [s for s in symbols if s != benchmark_symbol]
+
+        # Create tasks for remaining symbols
+        tasks = [
+            self._fetch_and_store_symbol(symbol, start_time_ms, hours, len(symbols))
+            for symbol in other_symbols
+        ]
+
+        # Execute all tasks in parallel with rate limiting
+        results: List[BackfillResult] = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        successful = 0
         failed_symbols = []
 
-        for symbol in symbols:
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Task exception: {result}")
+            elif isinstance(result, BackfillResult):
+                if result.success:
+                    successful += 1
+                else:
+                    failed_symbols.append(result.symbol)
+
+        # Final flush
+        await self.storage.flush_all()
+
+        elapsed = time.time() - start_time_wall
+        print(f"Backfill complete: {self._total_bars} bars written for {successful}/{len(symbols)} symbols in {elapsed:.1f}s")
+
+        if failed_symbols:
+            logger.warning(f"Failed to backfill: {', '.join(failed_symbols[:10])}{'...' if len(failed_symbols) > 10 else ''}")
+
+    async def _fetch_and_store_symbol(
+        self,
+        symbol: str,
+        start_time_ms: int,
+        hours: int,
+        total_symbols: int
+    ) -> BackfillResult:
+        """
+        Fetch klines for a single symbol with rate limiting and store to DB.
+        """
+        async with self._semaphore:
             try:
                 bars = await self._fetch_klines_for_symbol(symbol, start_time_ms, hours)
 
                 if bars:
-                    # Write to database
+                    # Write to database (batch write, will be flushed later)
                     await self.storage.batch_write_bars(bars)
-                    await self.storage.flush_all()
 
-                    total_bars += len(bars)
-                    logger.info(f"Backfilled {len(bars)} bars for {symbol} (total: {total_bars})")
+                    # Update progress
+                    async with self._progress_lock:
+                        self._total_bars += len(bars)
+                        self._completed_symbols += 1
+
+                        # Log progress every 10 symbols
+                        if self._completed_symbols % 10 == 0 or self._completed_symbols == total_symbols:
+                            print(f"Progress: {self._completed_symbols}/{total_symbols} symbols, {self._total_bars} bars")
+
+                    # Periodic flush (every 20 symbols)
+                    if self._completed_symbols % self.DEFAULT_BATCH_SIZE == 0:
+                        await self.storage.flush_all()
+
+                    return BackfillResult(symbol=symbol, bars_count=len(bars), success=True)
                 else:
-                    logger.warning(f"No data received for {symbol}")
-                    failed_symbols.append(symbol)
-
-                # Small delay to avoid rate limiting
-                await asyncio.sleep(0.5)
+                    return BackfillResult(symbol=symbol, bars_count=0, success=False, error="No data received")
 
             except Exception as e:
                 logger.error(f"Error backfilling {symbol}: {e}")
-                failed_symbols.append(symbol)
-
-        logger.info(f"Backfill complete: {total_bars} bars written for {len(symbols) - len(failed_symbols)}/{len(symbols)} symbols")
-
-        if failed_symbols:
-            logger.warning(f"Failed to backfill: {', '.join(failed_symbols)}")
+                return BackfillResult(symbol=symbol, bars_count=0, success=False, error=str(e))
 
     async def _fetch_klines_for_symbol(self, symbol: str, start_time_ms: int, hours: int) -> List[Bar]:
         """
@@ -95,7 +203,7 @@ class Backfiller:
             )
 
             if not klines:
-                logger.warning(f"No klines returned for {symbol} starting at {current_start_time}")
+                logger.debug(f"No klines returned for {symbol} starting at {current_start_time}")
                 break
 
             # Convert klines to Bar objects
@@ -109,14 +217,13 @@ class Backfiller:
                 last_close_time = klines[-1][6]  # Close time
                 current_start_time = last_close_time + 1
 
-            logger.debug(f"Fetched {len(klines)} klines for {symbol} (request {i+1}/{num_requests})")
-
-            # Small delay between requests
-            await asyncio.sleep(0.2)
+            # Minimal delay between pagination requests for same symbol
+            if i < num_requests - 1:
+                await asyncio.sleep(0.05)
 
         return bars
 
-    def _kline_to_bar(self, symbol: str, kline: List) -> Bar:
+    def _kline_to_bar(self, symbol: str, kline: List) -> Optional[Bar]:
         """
         Convert Binance kline data to Bar object.
 
@@ -177,7 +284,7 @@ class Backfiller:
 
     async def backfill_oi_for_symbols(self, symbols: List[str], hours: int = 13) -> None:
         """
-        Backfill historical OI data for all symbols.
+        Backfill historical OI data for all symbols in PARALLEL.
 
         Fetches OI history from REST API (5m resolution) and updates existing bars.
         Uses forward-fill to map 5m OI data to 1m bars.
@@ -186,16 +293,57 @@ class Backfiller:
             symbols: List of symbols to backfill
             hours: Number of hours to backfill (default 13 to match klines backfill)
         """
-        logger.info(f"Starting OI backfill for {len(symbols)} symbols, {hours} hours of data")
+        start_time_wall = time.time()
+
+        print(f"Starting OI backfill for {len(symbols)} symbols, {hours} hours of data")
 
         # Calculate how many 5m periods needed
         periods_5m = (hours * 60) // 5  # Convert hours to 5-minute periods
         limit = min(periods_5m, 500)  # Binance API limit is 500
 
-        total_bars_updated = 0
+        # Initialize semaphore for rate limiting
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._total_bars = 0
+        self._completed_symbols = 0
+
+        # Create tasks for all symbols
+        tasks = [
+            self._fetch_and_update_oi_symbol(symbol, limit, len(symbols))
+            for symbol in symbols
+        ]
+
+        # Execute all tasks in parallel
+        results: List[BackfillResult] = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        successful = 0
         failed_symbols = []
 
-        for symbol in symbols:
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"OI task exception: {result}")
+            elif isinstance(result, BackfillResult):
+                if result.success:
+                    successful += 1
+                else:
+                    failed_symbols.append(result.symbol)
+
+        elapsed = time.time() - start_time_wall
+        print(f"OI backfill complete: {self._total_bars} bars updated for {successful}/{len(symbols)} symbols in {elapsed:.1f}s")
+
+        if failed_symbols:
+            logger.warning(f"Failed to backfill OI for: {', '.join(failed_symbols[:10])}{'...' if len(failed_symbols) > 10 else ''}")
+
+    async def _fetch_and_update_oi_symbol(
+        self,
+        symbol: str,
+        limit: int,
+        total_symbols: int
+    ) -> BackfillResult:
+        """
+        Fetch OI for a single symbol with rate limiting and update bars.
+        """
+        async with self._semaphore:
             try:
                 # Fetch OI history from REST API
                 oi_data = await self.rest_client.get_oi_history(
@@ -205,27 +353,25 @@ class Backfiller:
                 )
 
                 if not oi_data:
-                    logger.warning(f"No OI data received for {symbol} (may not have API key)")
-                    failed_symbols.append(symbol)
-                    continue
+                    return BackfillResult(symbol=symbol, bars_count=0, success=False, error="No OI data (may need API key)")
 
                 # Convert OI data to 1m bar updates
                 bars_updated = await self._update_bars_with_oi(symbol, oi_data)
 
-                total_bars_updated += bars_updated
-                logger.info(f"Updated {bars_updated} bars with OI for {symbol}")
+                # Update progress
+                async with self._progress_lock:
+                    self._total_bars += bars_updated
+                    self._completed_symbols += 1
 
-                # Small delay to avoid rate limiting
-                await asyncio.sleep(0.5)
+                    # Log progress every 20 symbols
+                    if self._completed_symbols % 20 == 0 or self._completed_symbols == total_symbols:
+                        print(f"OI Progress: {self._completed_symbols}/{total_symbols} symbols, {self._total_bars} bars updated")
+
+                return BackfillResult(symbol=symbol, bars_count=bars_updated, success=True)
 
             except Exception as e:
                 logger.error(f"Error backfilling OI for {symbol}: {e}")
-                failed_symbols.append(symbol)
-
-        logger.info(f"OI backfill complete: {total_bars_updated} bars updated for {len(symbols) - len(failed_symbols)}/{len(symbols)} symbols")
-
-        if failed_symbols:
-            logger.warning(f"Failed to backfill OI for: {', '.join(failed_symbols)}")
+                return BackfillResult(symbol=symbol, bars_count=0, success=False, error=str(e))
 
     async def _update_bars_with_oi(self, symbol: str, oi_data: List[Dict]) -> int:
         """
@@ -302,3 +448,19 @@ class Backfiller:
         except Exception as e:
             logger.error(f"Error updating bars with OI for {symbol}: {e}")
             return 0
+
+
+# Legacy function for backwards compatibility
+async def backfill_symbols_sequential(
+    rest_client: BinanceRestClient,
+    storage: Storage,
+    symbols: List[str],
+    hours: int = 13
+) -> None:
+    """
+    Legacy sequential backfill (for debugging or rate limit issues).
+
+    Use Backfiller class with parallel fetching for better performance.
+    """
+    backfiller = Backfiller(rest_client, storage, max_concurrent=1)
+    await backfiller.backfill_symbols(symbols, hours)

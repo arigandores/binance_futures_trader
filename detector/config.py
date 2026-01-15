@@ -19,56 +19,20 @@ class ApiConfig:
 
 
 @dataclass
-class SectorConfig:
-    """Single sector configuration."""
-    name: str
-    symbols: List[str]
-
-    def __post_init__(self):
-        """Validate sector configuration."""
-        if not self.name:
-            raise ValueError("Sector name cannot be empty")
-        if not self.symbols:
-            raise ValueError(f"Sector '{self.name}' must have at least one symbol")
-
-
-@dataclass
 class UniverseConfig:
     """Symbol universe configuration."""
     benchmark_symbol: str = "BTCUSDT"
-    sectors: List[SectorConfig] = field(default_factory=lambda: [
-        SectorConfig(name="Privacy", symbols=["ZECUSDT", "DASHUSDT", "XMRUSDT"])
+    symbols: List[str] = field(default_factory=lambda: [
+        "ZECUSDT", "DASHUSDT", "XMRUSDT"
     ])
 
     @property
     def all_symbols(self) -> List[str]:
-        """Get all symbols (benchmark + all sectors)."""
-        sector_symbols = []
-        for sector in self.sectors:
-            sector_symbols.extend(sector.symbols)
-        return [self.benchmark_symbol] + sector_symbols
-
-    @property
-    def sector_symbols(self) -> List[str]:
-        """Get all sector symbols (for backward compatibility)."""
-        symbols = []
-        for sector in self.sectors:
-            symbols.extend(sector.symbols)
-        return symbols
-
-    def get_sector_for_symbol(self, symbol: str) -> Optional[SectorConfig]:
-        """Get the sector config for a given symbol."""
-        for sector in self.sectors:
-            if symbol in sector.symbols:
-                return sector
-        return None
-
-    def get_sector_symbols(self, symbol: str) -> List[str]:
-        """Get all symbols in the same sector as the given symbol."""
-        sector = self.get_sector_for_symbol(symbol)
-        if sector:
-            return sector.symbols
-        return []
+        """Get all symbols (benchmark + configured symbols)."""
+        # Ensure benchmark is first and not duplicated
+        if self.benchmark_symbol in self.symbols:
+            return [self.benchmark_symbol] + [s for s in self.symbols if s != self.benchmark_symbol]
+        return [self.benchmark_symbol] + self.symbols
 
 
 @dataclass
@@ -80,7 +44,6 @@ class WindowsConfig:
     beta_aggregation_minutes: int = 5
     initiator_eval_window_bars: int = 15
     confirm_window_bars: int = 60
-    sector_diffusion_window_bars: int = 120
 
 
 @dataclass
@@ -91,8 +54,6 @@ class ThresholdsConfig:
     taker_dominance_min: float = 0.65
     liquidation_z_confirm: float = 2.0
     funding_abs_threshold: float = 0.0010
-    sector_k_min: int = 2
-    sector_share_min: float = 0.40
 
 
 @dataclass
@@ -119,10 +80,6 @@ class StorageConfig:
     batch_write_interval_sec: int = 5
 
 
-@dataclass
-class DiffusionConfig:
-    """Sector diffusion configuration."""
-    mode: str = "after_initiator"
 
 
 @dataclass
@@ -259,7 +216,6 @@ class Config:
     thresholds: ThresholdsConfig = field(default_factory=ThresholdsConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
-    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     position_management: PositionManagementConfig = field(default_factory=PositionManagementConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
@@ -281,24 +237,30 @@ class Config:
 
         if 'universe' in data:
             universe_data = data['universe']
-            # Parse sectors if present
+            # Support old 'sectors' format - flatten to symbols list
             if 'sectors' in universe_data:
-                sectors = []
+                symbols = []
                 for sector_data in universe_data['sectors']:
-                    sectors.append(SectorConfig(**sector_data))
-                universe_data['sectors'] = sectors
-            # Support old format (sector_symbols) for backward compatibility
+                    symbols.extend(sector_data.get('symbols', []))
+                universe_data['symbols'] = symbols
+                del universe_data['sectors']
+            # Support old 'sector_symbols' format
             elif 'sector_symbols' in universe_data:
-                sectors = [SectorConfig(name="Default", symbols=universe_data['sector_symbols'])]
-                universe_data['sectors'] = sectors
+                universe_data['symbols'] = universe_data['sector_symbols']
                 del universe_data['sector_symbols']
             config.universe = UniverseConfig(**universe_data)
 
         if 'windows' in data:
-            config.windows = WindowsConfig(**data['windows'])
+            # Filter out removed parameters for backward compatibility
+            windows_data = {k: v for k, v in data['windows'].items()
+                          if k not in {'sector_diffusion_window_bars'}}
+            config.windows = WindowsConfig(**windows_data)
 
         if 'thresholds' in data:
-            config.thresholds = ThresholdsConfig(**data['thresholds'])
+            # Filter out removed parameters for backward compatibility
+            thresholds_data = {k: v for k, v in data['thresholds'].items()
+                             if k not in {'sector_k_min', 'sector_share_min', 'oi_delta_z_confirm'}}
+            config.thresholds = ThresholdsConfig(**thresholds_data)
 
         if 'alerts' in data:
             alerts_data = data['alerts']
@@ -310,8 +272,7 @@ class Config:
         if 'storage' in data:
             config.storage = StorageConfig(**data['storage'])
 
-        if 'diffusion' in data:
-            config.diffusion = DiffusionConfig(**data['diffusion'])
+        # Ignore 'diffusion' section for backward compatibility (removed feature)
 
         if 'position_management' in data:
             pm_data = data['position_management']
@@ -332,16 +293,15 @@ class Config:
         if not self.universe.benchmark_symbol:
             raise ValueError("benchmark_symbol cannot be empty")
 
-        if not self.universe.sectors:
-            raise ValueError("At least one sector must be configured")
+        if not self.universe.symbols:
+            raise ValueError("At least one symbol must be configured")
 
-        # Check for duplicate symbols across sectors
-        all_sector_symbols = []
-        for sector in self.universe.sectors:
-            for symbol in sector.symbols:
-                if symbol in all_sector_symbols:
-                    raise ValueError(f"Symbol {symbol} appears in multiple sectors")
-                all_sector_symbols.append(symbol)
+        # Check for duplicate symbols
+        seen = set()
+        for symbol in self.universe.symbols:
+            if symbol in seen:
+                raise ValueError(f"Duplicate symbol: {symbol}")
+            seen.add(symbol)
 
         # Check windows
         if self.windows.bar_interval_sec <= 0:
@@ -353,12 +313,6 @@ class Config:
         # Check thresholds
         if self.thresholds.taker_dominance_min < 0.5 or self.thresholds.taker_dominance_min > 1.0:
             raise ValueError("taker_dominance_min must be between 0.5 and 1.0")
-
-        if self.thresholds.sector_k_min < 1:
-            raise ValueError("sector_k_min must be at least 1")
-
-        if self.thresholds.sector_share_min <= 0 or self.thresholds.sector_share_min > 1.0:
-            raise ValueError("sector_share_min must be between 0 and 1.0")
 
         # Check storage
         storage_path = Path(self.storage.sqlite_path)

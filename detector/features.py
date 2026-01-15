@@ -78,15 +78,38 @@ class FeatureCalculator:
 
     async def backfill(self) -> None:
         """Load ALL bars from DB, populate windows, and write features to database."""
-        logger.info("Backfilling rolling windows from database...")
+        import time
+        start_time = time.time()
+        print("Backfilling rolling windows from database...")
 
-        # First pass: Load ALL bars into windows (not just 720)
-        # This is needed to calculate features for all historical data
+        # First pass: Load ALL bars into windows
+        # BTC (benchmark) is loaded FIRST to ensure it's available for calculations
         all_bars_by_symbol = {}
+        benchmark = self.config.universe.benchmark_symbol
 
-        for symbol in self.config.universe.all_symbols:
-            # Load ALL bars from database (no limit)
-            bars = await self.storage.get_recent_bars(symbol, limit=10000)  # Large limit to get all data
+        # Helper function for parallel loading
+        async def load_bars_for_symbol(symbol: str):
+            bars = await self.storage.get_recent_bars(symbol, limit=10000)
+            return symbol, bars
+
+        # STEP 1: Load BTC first (required for beta/excess return calculations)
+        print(f"Loading benchmark {benchmark} first...")
+        btc_symbol, btc_bars = await load_bars_for_symbol(benchmark)
+        all_bars_by_symbol[btc_symbol] = btc_bars
+
+        btc_window = RollingWindow(maxlen=720)
+        for bar in btc_bars[-720:]:
+            btc_window.append(bar)
+        self.windows[btc_symbol] = btc_window
+        print(f"Benchmark {benchmark} loaded: {len(btc_bars)} bars")
+
+        # STEP 2: Load remaining symbols in parallel
+        other_symbols = [s for s in self.config.universe.all_symbols if s != benchmark]
+
+        tasks = [load_bars_for_symbol(s) for s in other_symbols]
+        results = await asyncio.gather(*tasks)
+
+        for symbol, bars in results:
             all_bars_by_symbol[symbol] = bars
 
             window = RollingWindow(maxlen=720)
@@ -95,117 +118,142 @@ class FeatureCalculator:
                 window.append(bar)
 
             self.windows[symbol] = window
-            logger.debug(f"Loaded {len(bars)} bars for {symbol} (keeping {len(bars[-720:])} in rolling window)")
 
-        # Second pass: Calculate and WRITE features for ALL historical bars
-        logger.info("Calculating features for all historical data...")
+        load_time = time.time() - start_time
+        print(f"Loaded bars for {len(self.windows)} symbols in {load_time:.1f}s")
 
-        btc_bars = all_bars_by_symbol.get(self.config.universe.benchmark_symbol, [])
+        # Second pass: Calculate features using VECTORIZED numpy operations
+        print("Calculating features for all historical data (vectorized)...")
+
+        btc_bars = all_bars_by_symbol.get(benchmark, [])
         if len(btc_bars) < 15:
-            logger.warning("Insufficient BTC data for feature calculation")
+            logger.warning(f"Insufficient {benchmark} data for feature calculation ({len(btc_bars)} bars, need 15)")
             return
 
-        # Create temporary extended windows that hold ALL bars (for backfill calculation)
-        extended_windows = {}
+        # Pre-convert ALL data to numpy arrays ONCE (major optimization)
+        print("Converting data to numpy arrays...")
+        numpy_data = {}
         for symbol in self.config.universe.all_symbols:
             bars = all_bars_by_symbol.get(symbol, [])
             if len(bars) < 15:
                 continue
 
-            extended_window = RollingWindow(maxlen=len(bars) + 100)  # Large enough for all bars
-            for bar in bars:
-                extended_window.append(bar)
-            extended_windows[symbol] = extended_window
+            # Extract all data into numpy arrays at once
+            numpy_data[symbol] = {
+                'closes': np.array([b.close for b in bars], dtype=np.float64),
+                'volumes': np.array([b.volume for b in bars], dtype=np.float64),
+                'taker_buys': np.array([b.taker_buy for b in bars], dtype=np.float64),
+                'taker_sells': np.array([b.taker_sell for b in bars], dtype=np.float64),
+                'ts_minutes': np.array([b.ts_minute for b in bars], dtype=np.int64),
+                'fundings': [b.funding for b in bars],  # Keep as list (may have None)
+                'bars': bars
+            }
 
-        # BTC extended window
-        btc_extended_window = extended_windows.get(self.config.universe.benchmark_symbol)
-        if not btc_extended_window:
-            logger.warning("No BTC extended window available")
+        if benchmark not in numpy_data:
+            logger.warning("No BTC numpy data available")
             return
 
-        # Calculate features for each symbol
+        btc_closes = numpy_data[benchmark]['closes']
+
+        # Calculate features for each symbol with progress tracking
         total_features_written = 0
+        symbols_processed = 0
+        symbols_to_process = [s for s in self.config.universe.all_symbols if s in numpy_data]
+        total_symbols = len(symbols_to_process)
+        calc_start_time = time.time()
 
-        for symbol in self.config.universe.all_symbols:
-            bars = all_bars_by_symbol.get(symbol, [])
-            extended_window = extended_windows.get(symbol)
+        # Process symbols in batches for better DB performance
+        BATCH_SIZE = 10  # Flush DB every N symbols
 
-            if not extended_window or len(bars) < 15:
-                continue
+        for symbol in symbols_to_process:
+            data = numpy_data[symbol]
+            closes = data['closes']
+            volumes = data['volumes']
+            taker_buys = data['taker_buys']
+            taker_sells = data['taker_sells']
+            ts_minutes = data['ts_minutes']
+            fundings = data['fundings']
+            bars = data['bars']
+            n = len(closes)
 
+            # Pre-calculate beta once per symbol
+            symbol_beta = self._calculate_beta_vectorized(closes, btc_closes)
+
+            # VECTORIZED calculations for all bars at once
+            # 1. Calculate all returns vectorized
+            r_1m_all = np.zeros(n)
+            r_15m_all = np.zeros(n)
+            btc_r_15m_all = np.zeros(n)
+
+            # Log returns: ln(close[i] / close[i-lookback])
+            r_1m_all[1:] = np.log(closes[1:] / np.maximum(closes[:-1], 1e-10))
+            r_15m_all[15:] = np.log(closes[15:] / np.maximum(closes[:-15], 1e-10))
+            btc_r_15m_all[15:] = np.log(btc_closes[15:] / np.maximum(btc_closes[:-15], 1e-10))
+
+            # 2. Calculate excess returns
+            er_15m_all = r_15m_all - symbol_beta * btc_r_15m_all
+
+            # 3. Calculate rolling 15-bar volume sums
+            vol_15m_all = np.convolve(volumes, np.ones(15), mode='full')[:n]
+            # Fix first 14 values (partial sums)
+            for i in range(14):
+                vol_15m_all[i] = np.sum(volumes[:i+1])
+
+            # 4. Calculate rolling taker buy share
+            taker_total = taker_buys + taker_sells
+            # Rolling 15-bar sums
+            taker_buy_sum = np.convolve(taker_buys, np.ones(15), mode='full')[:n]
+            taker_total_sum = np.convolve(taker_total, np.ones(15), mode='full')[:n]
+            taker_buy_share_all = np.where(taker_total_sum > 0, taker_buy_sum / taker_total_sum, 0.5)
+
+            # 5. Calculate rolling z-scores (this is the most expensive part)
+            z_er_15m_all = self._rolling_robust_zscore_vectorized(er_15m_all)
+            z_vol_15m_all = self._rolling_robust_zscore_vectorized(volumes)
+
+            # Build features batch
             features_batch = []
-
-            # Calculate features for each historical bar (starting from bar 15)
-            for i in range(15, len(bars)):
-                bar = bars[i]
-
-                # Calculate returns
-                r_1m = self._calculate_return_at_index(extended_window.closes, i, lookback=1)
-                r_15m = self._calculate_return_at_index(extended_window.closes, i, lookback=15)
-
-                # Calculate beta
-                beta = self._calculate_beta_at_index_extended(symbol, i, extended_windows)
-
-                # Calculate BTC 15m return
-                btc_r_15m = self._calculate_return_at_index(btc_extended_window.closes, i, lookback=15)
-
-                # Calculate excess return
-                er_15m = r_15m - beta * btc_r_15m
-
-                # Store excess return in extended window for z-score calculation
-                extended_window.excess_returns.append(er_15m)
-
-                # Calculate z-scores
-                z_er_15m = self._robust_zscore(list(extended_window.excess_returns))
-                z_vol_15m = self._robust_zscore(list(extended_window.volumes)[:i+1])
-
-                # Volume sum over last 15 bars
-                vol_15m = sum(list(extended_window.volumes)[max(0, i-14):i+1])
-
-                # Taker buy share
-                taker_buy_share_15m = self._calculate_taker_share_at_index(extended_window, i, lookback=15)
-
-                # Create features object
+            for i in range(15, n):
                 features = Features(
                     symbol=symbol,
-                    ts_minute=bar.ts_minute,
-                    r_1m=r_1m,
-                    r_15m=r_15m,
-                    beta=beta,
-                    er_15m=er_15m,
-                    z_er_15m=z_er_15m,
-                    vol_15m=vol_15m,
-                    z_vol_15m=z_vol_15m,
-                    taker_buy_share_15m=taker_buy_share_15m,
-                    funding_rate=bar.funding
+                    ts_minute=ts_minutes[i],
+                    r_1m=float(r_1m_all[i]),
+                    r_15m=float(r_15m_all[i]),
+                    beta=symbol_beta,
+                    er_15m=float(er_15m_all[i]),
+                    z_er_15m=float(z_er_15m_all[i]),
+                    vol_15m=float(vol_15m_all[i]),
+                    z_vol_15m=float(z_vol_15m_all[i]),
+                    taker_buy_share_15m=float(taker_buy_share_all[i]),
+                    funding_rate=fundings[i]
                 )
-
                 features.direction = features.determine_direction()
                 features_batch.append(features)
 
-            # Write features to database in batches
+            # Write features to database
             if features_batch:
                 await self.storage.batch_write_features(features_batch)
-                await self.storage.flush_all()
                 total_features_written += len(features_batch)
-                logger.info(f"Wrote {len(features_batch)} features for {symbol}")
+                symbols_processed += 1
 
-        # Now populate the actual rolling windows with pre-calculated excess returns
-        logger.info("Populating rolling windows with pre-calculated data...")
+                # Store excess returns for rolling window
+                if symbol in self.windows:
+                    window = self.windows[symbol]
+                    for er in er_15m_all[-720:]:
+                        window.excess_returns.append(er)
 
-        for symbol in self.config.universe.all_symbols:
-            extended_window = extended_windows.get(symbol)
-            window = self.windows.get(symbol)
+                # Flush DB periodically and show progress
+                if symbols_processed % BATCH_SIZE == 0:
+                    await self.storage.flush_all()
+                    elapsed = time.time() - calc_start_time
+                    rate = symbols_processed / elapsed if elapsed > 0 else 0
+                    remaining = (total_symbols - symbols_processed) / rate if rate > 0 else 0
+                    print(f"Features: {symbols_processed}/{total_symbols} symbols ({total_features_written} features) - {remaining:.0f}s remaining")
 
-            if not extended_window or not window:
-                continue
+        # Final flush
+        await self.storage.flush_all()
 
-            # Copy last 720 excess returns to the actual rolling window
-            if len(extended_window.excess_returns) > 0:
-                for er in list(extended_window.excess_returns)[-720:]:
-                    window.excess_returns.append(er)
-
-        logger.info(f"Backfill complete: {total_features_written} features written to database for {len(self.windows)} symbols")
+        total_time = time.time() - start_time
+        print(f"Backfill complete: {total_features_written} features written to database for {len(self.windows)} symbols in {total_time:.1f}s")
 
     async def run(self) -> None:
         """Consume bars and calculate features."""
@@ -467,6 +515,101 @@ class FeatureCalculator:
 
         z = (last_value - median) / robust_sigma
         return z
+
+    def _rolling_robust_zscore_vectorized(self, series: np.ndarray, window_size: int = 720) -> np.ndarray:
+        """
+        Calculate rolling robust z-scores for entire series at once using vectorized operations.
+
+        Uses MAD (Median Absolute Deviation) for robustness against outliers.
+        z = (x - median) / (1.4826 * MAD)
+
+        This is significantly faster than calling _robust_zscore() in a loop.
+        """
+        n = len(series)
+        result = np.zeros(n)
+
+        if n < 10:
+            return result
+
+        # For efficiency, use a sliding window approach
+        # Calculate rolling statistics using numpy operations
+        for i in range(10, n):
+            # Get window (up to window_size elements, but at least 10)
+            start_idx = max(0, i - window_size + 1)
+            window_data = series[start_idx:i + 1]
+
+            if len(window_data) < 10:
+                continue
+
+            # Filter NaN values
+            valid_data = window_data[~np.isnan(window_data)]
+
+            if len(valid_data) < 10:
+                continue
+
+            median = np.median(valid_data)
+            mad = np.median(np.abs(valid_data - median))
+            robust_sigma = 1.4826 * mad
+
+            if robust_sigma < 1e-9:
+                result[i] = 0.0
+            else:
+                result[i] = (series[i] - median) / robust_sigma
+
+        return result
+
+    def _calculate_beta_vectorized(self, closes: np.ndarray, btc_closes: np.ndarray) -> float:
+        """
+        Calculate beta vs BTC using vectorized numpy operations.
+
+        Uses 5-minute aggregated returns over 240 1-minute bars (48 x 5m = 4h).
+        beta = cov(asset, btc) / var(btc)
+        """
+        n = min(len(closes), len(btc_closes))
+
+        if n < 240:  # Need enough data for beta calculation
+            return 0.0
+
+        # Use last 240 bars
+        closes = closes[-240:]
+        btc_closes = btc_closes[-240:]
+
+        # Aggregate to 5-minute returns
+        agg_minutes = 5
+        num_periods = 240 // agg_minutes  # 48 periods
+
+        symbol_5m_returns = []
+        btc_5m_returns = []
+
+        for i in range(num_periods):
+            idx_start = i * agg_minutes
+            idx_end = (i + 1) * agg_minutes
+
+            if idx_end > len(closes):
+                break
+
+            # 5m return = ln(close_end / close_start)
+            if closes[idx_start] > 0 and btc_closes[idx_start] > 0:
+                symbol_ret = np.log(closes[idx_end - 1] / closes[idx_start])
+                btc_ret = np.log(btc_closes[idx_end - 1] / btc_closes[idx_start])
+                symbol_5m_returns.append(symbol_ret)
+                btc_5m_returns.append(btc_ret)
+
+        if len(symbol_5m_returns) < 10:
+            return 0.0
+
+        symbol_arr = np.array(symbol_5m_returns)
+        btc_arr = np.array(btc_5m_returns)
+
+        var_btc = np.var(btc_arr)
+
+        if var_btc < 1e-12:
+            return 0.0
+
+        cov = np.cov(symbol_arr, btc_arr)[0, 1]
+        beta = cov / var_btc
+
+        return float(beta)
 
     def _calculate_taker_share(self, window: RollingWindow, lookback: int = 15) -> Optional[float]:
         """Calculate taker buy share over last N bars."""
