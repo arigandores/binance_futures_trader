@@ -176,8 +176,28 @@ class FeatureCalculator:
             bars = data['bars']
             n = len(closes)
 
+            # Align BTC data to same length as current symbol
+            # Different symbols may have different amounts of historical data
+            n_btc = len(btc_closes)
+            if n_btc < n:
+                # If BTC has fewer bars than this symbol, use available BTC data length
+                # Take the last n_btc bars from the symbol to align
+                logger.warning(f"{symbol}: BTC has fewer bars ({n_btc}) than symbol ({n}), using aligned subset")
+                closes = closes[-n_btc:]
+                volumes = volumes[-n_btc:]
+                taker_buys = taker_buys[-n_btc:]
+                taker_sells = taker_sells[-n_btc:]
+                ts_minutes = ts_minutes[-n_btc:]
+                fundings = fundings[-n_btc:]
+                bars = bars[-n_btc:]
+                n = n_btc
+                btc_closes_aligned = btc_closes
+            else:
+                # Normal case: BTC has same or more bars, use last n bars from BTC
+                btc_closes_aligned = btc_closes[-n:]
+
             # Pre-calculate beta once per symbol
-            symbol_beta = self._calculate_beta_vectorized(closes, btc_closes)
+            symbol_beta = self._calculate_beta_vectorized(closes, btc_closes_aligned)
 
             # VECTORIZED calculations for all bars at once
             # 1. Calculate all returns vectorized
@@ -188,7 +208,7 @@ class FeatureCalculator:
             # Log returns: ln(close[i] / close[i-lookback])
             r_1m_all[1:] = np.log(closes[1:] / np.maximum(closes[:-1], 1e-10))
             r_15m_all[15:] = np.log(closes[15:] / np.maximum(closes[:-15], 1e-10))
-            btc_r_15m_all[15:] = np.log(btc_closes[15:] / np.maximum(btc_closes[:-15], 1e-10))
+            btc_r_15m_all[15:] = np.log(btc_closes_aligned[15:] / np.maximum(btc_closes_aligned[:-15], 1e-10))
 
             # 2. Calculate excess returns
             er_15m_all = r_15m_all - symbol_beta * btc_r_15m_all
