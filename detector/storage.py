@@ -5,16 +5,43 @@ import logging
 from pathlib import Path
 
 # Performance: orjson is 4-6x faster than standard json
+# Fix: Use OPT_SERIALIZE_NUMPY to handle numpy.float64/int64 types
 try:
     import orjson
     def json_dumps(data):
-        return orjson.dumps(data).decode('utf-8') if data else None
+        if data is None:
+            return None
+        # OPT_SERIALIZE_NUMPY: Serialize numpy.ndarray and numpy scalar types (float64, int64, etc.)
+        return orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY).decode('utf-8')
     def json_loads(data):
         return orjson.loads(data) if data else {}
 except ImportError:
     import json
+    import numpy as np
+    
+    def _convert_numpy_types(obj):
+        """Recursively convert numpy types to Python native types for JSON serialization."""
+        if isinstance(obj, dict):
+            return {k: _convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [_convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return obj
+    
     def json_dumps(data):
-        return json.dumps(data) if data else None
+        if data is None:
+            return None
+        # Convert numpy types before serialization
+        converted = _convert_numpy_types(data)
+        return json.dumps(converted)
+    
     def json_loads(data):
         return json.loads(data) if data else {}
 from typing import List, Optional, Tuple
