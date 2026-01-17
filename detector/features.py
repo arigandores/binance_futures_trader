@@ -224,7 +224,14 @@ class FeatureCalculator:
             # Rolling 15-bar sums
             taker_buy_sum = np.convolve(taker_buys, np.ones(15), mode='full')[:n]
             taker_total_sum = np.convolve(taker_total, np.ones(15), mode='full')[:n]
-            taker_buy_share_all = np.where(taker_total_sum > 0, taker_buy_sum / taker_total_sum, 0.5)
+            # Use np.divide with out/where to avoid division by zero warning
+            # (np.where evaluates both branches before selecting, causing warnings)
+            taker_buy_share_all = np.divide(
+                taker_buy_sum,
+                taker_total_sum,
+                out=np.full_like(taker_buy_sum, 0.5),
+                where=taker_total_sum > 0
+            )
 
             # 5. Calculate rolling z-scores (this is the most expensive part)
             z_er_15m_all = self._rolling_robust_zscore_vectorized(er_15m_all)
@@ -235,7 +242,7 @@ class FeatureCalculator:
             for i in range(15, n):
                 features = Features(
                     symbol=symbol,
-                    ts_minute=ts_minutes[i],
+                    ts_minute=int(ts_minutes[i]),  # Convert numpy.int64 to Python int for SQLite
                     r_1m=float(r_1m_all[i]),
                     r_15m=float(r_15m_all[i]),
                     beta=symbol_beta,
