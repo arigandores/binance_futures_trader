@@ -5,10 +5,23 @@ Binance limits: 200 streams per connection, 1024 total connections.
 """
 
 import asyncio
-import json
 import logging
 import time
 import websockets
+
+# Performance: orjson is 4-6x faster than standard json
+try:
+    import orjson
+    def json_loads(data):
+        return orjson.loads(data)
+    def json_dumps(data):
+        return orjson.dumps(data).decode('utf-8')
+except ImportError:
+    import json
+    def json_loads(data):
+        return json.loads(data)
+    def json_dumps(data):
+        return json.dumps(data)
 from typing import Dict, List, Optional
 from detector.models import StreamType
 
@@ -78,12 +91,12 @@ class BinanceWebSocketClient:
             }
 
             logger.debug(f"Subscribing to {len(batch)} streams (id={request_id})")
-            await ws.send(json.dumps(subscribe_msg))
+            await ws.send(json_dumps(subscribe_msg))
 
             # Wait for subscription confirmation
             try:
                 response = await asyncio.wait_for(ws.recv(), timeout=10.0)
-                data = json.loads(response)
+                data = json_loads(response)
 
                 if data.get("id") == request_id:
                     if data.get("result") is None:
@@ -160,7 +173,7 @@ class BinanceWebSocketClient:
 
         async for message in ws:
             try:
-                data = json.loads(message)
+                data = json_loads(message)
                 await self._process_message(data)
                 msg_count += 1
 
@@ -170,10 +183,8 @@ class BinanceWebSocketClient:
                     logger.info(f"[Conn {conn_id}] Active: {msg_count} messages received")
                     last_log_time = current_time
 
-            except json.JSONDecodeError as e:
-                logger.warning(f"[Conn {conn_id}] Failed to parse message: {e}")
             except Exception as e:
-                logger.error(f"[Conn {conn_id}] Error processing message: {e}")
+                logger.warning(f"[Conn {conn_id}] Error processing message: {e}")
 
     async def _process_message(self, msg: Dict) -> None:
         """Process incoming WebSocket message and emit to queue."""

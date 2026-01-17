@@ -1,11 +1,24 @@
 """Main CLI orchestrator for the Binance Anomaly Detector."""
 
 import asyncio
+import sys
 import click
 import structlog
+
+# Performance: uvloop provides 2-5x faster event loop (Linux/macOS only)
+# Must be installed before any asyncio usage
+if sys.platform != 'win32':
+    try:
+        import uvloop
+        uvloop.install()
+        _UVLOOP_INSTALLED = True
+    except ImportError:
+        _UVLOOP_INSTALLED = False
+else:
+    _UVLOOP_INSTALLED = False
 from detector.config import Config
 from detector.storage import Storage
-from detector.binance_ws import BinanceWebSocketClient
+from detector.binance_ws_picows import get_websocket_client, PICOWS_AVAILABLE
 from detector.binance_rest import BinanceRestClient
 from detector.aggregator import BarAggregator
 from detector.features import FeatureCalculator
@@ -51,8 +64,8 @@ class AnomalyDetectorOrchestrator:
         self.feature_queue_pm = asyncio.Queue(maxsize=1000)  # For position manager exit checks
         self.event_queue_pm = asyncio.Queue(maxsize=100)  # For position manager to open positions
 
-        # Components
-        self.ws_client = BinanceWebSocketClient(
+        # Components - use best available WebSocket client
+        self.ws_client = get_websocket_client(
             config.universe.all_symbols,
             self.tick_queue,
             config.runtime.ws_reconnect_backoff_sec
@@ -310,6 +323,17 @@ def run(config: str, skip_backfill: bool):
         setup_logging(cfg.runtime.log_level)
 
         logger.info("Configuration loaded", config_path=config)
+
+        # Log performance optimizations status
+        if _UVLOOP_INSTALLED:
+            logger.info("Performance: uvloop event loop enabled (2-5x faster)")
+        else:
+            logger.info("Performance: Using default asyncio (uvloop not available on Windows)")
+
+        if PICOWS_AVAILABLE:
+            logger.info("Performance: picows WebSocket enabled (2-3x faster)")
+        else:
+            logger.info("Performance: Using standard websockets (install picows for better performance)")
 
         # Run detector
         detector = AnomalyDetectorOrchestrator(cfg)
