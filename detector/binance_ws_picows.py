@@ -72,6 +72,8 @@ if PICOWS_AVAILABLE:
             self.last_log_time = 0
             self._transport: Optional[WSTransport] = None
             self._subscribe_complete = asyncio.Event()
+            self._pending_subscribe_ids: Dict[int, int] = {}  # id -> stream count
+            self._confirmed_streams = 0
 
         def on_ws_connected(self, transport: WSTransport):
             """Called when WebSocket connection is established."""
@@ -81,7 +83,7 @@ if PICOWS_AVAILABLE:
             asyncio.create_task(self._subscribe())
 
         async def _subscribe(self):
-            """Send SUBSCRIBE request for all streams."""
+            """Send SUBSCRIBE request for all streams with confirmation waiting."""
             if not self._transport:
                 return
 
@@ -89,22 +91,56 @@ if PICOWS_AVAILABLE:
             batches = [self.streams[i:i + MAX_SUBSCRIBE_BATCH]
                        for i in range(0, len(self.streams), MAX_SUBSCRIBE_BATCH)]
 
-            for batch in batches:
+            total_streams = len(self.streams)
+
+            for i, batch in enumerate(batches):
+                subscribe_id = self.client._get_subscribe_id()
+                self._pending_subscribe_ids[subscribe_id] = len(batch)
+
                 subscribe_msg = {
                     "method": "SUBSCRIBE",
                     "params": batch,
-                    "id": self.client._get_subscribe_id()
+                    "id": subscribe_id
                 }
                 self._transport.send(WSMsgType.TEXT, json_dumps(subscribe_msg).encode())
+                logger.debug(f"[Conn {self.conn_id}] Sent subscribe batch {i+1}/{len(batches)} (id={subscribe_id}, {len(batch)} streams)")
+
+                # Wait a bit between batches to avoid rate limiting
+                if i < len(batches) - 1:
+                    await asyncio.sleep(0.1)
+
+            # Wait for all confirmations (with timeout)
+            try:
+                for _ in range(50):  # Max 5 seconds total
+                    if self._confirmed_streams >= total_streams:
+                        break
+                    await asyncio.sleep(0.1)
+
+                if self._confirmed_streams >= total_streams:
+                    logger.info(f"[Conn {self.conn_id}] All {total_streams} streams confirmed")
+                else:
+                    logger.warning(f"[Conn {self.conn_id}] Only {self._confirmed_streams}/{total_streams} streams confirmed (continuing anyway)")
+            except Exception as e:
+                logger.warning(f"[Conn {self.conn_id}] Error waiting for confirmations: {e}")
 
             self._subscribe_complete.set()
-            logger.info(f"[Conn {self.conn_id}] Subscription requests sent")
+            logger.info(f"[Conn {self.conn_id}] Subscription complete")
 
         def on_ws_frame(self, transport: WSTransport, frame: WSFrame):
             """Called for each received WebSocket frame."""
             if frame.msg_type == WSMsgType.TEXT:
                 try:
                     data = json_loads(frame.get_payload_as_bytes())
+
+                    # Handle subscription confirmations
+                    if 'id' in data and 'result' in data:
+                        sub_id = data.get('id')
+                        if sub_id in self._pending_subscribe_ids:
+                            stream_count = self._pending_subscribe_ids.pop(sub_id)
+                            self._confirmed_streams += stream_count
+                            logger.debug(f"[Conn {self.conn_id}] Subscribe confirmed (id={sub_id}, +{stream_count} streams, total={self._confirmed_streams})")
+                        return
+
                     # Use create_task to avoid blocking the event loop
                     asyncio.create_task(self._process_message(data))
                     self.msg_count += 1
