@@ -397,6 +397,36 @@ class Storage:
         except Exception as e:
             logger.error(f"Error updating cooldown for {symbol}: {e}")
 
+    async def clear_expired_cooldowns(self, current_ts: int, max_cooldown_ms: int) -> int:
+        """
+        Clear cooldown entries that have definitely expired.
+
+        Args:
+            current_ts: Current timestamp in milliseconds
+            max_cooldown_ms: Maximum cooldown duration in milliseconds
+
+        Returns:
+            Number of expired cooldowns cleared
+        """
+        if not self.db:
+            return 0
+
+        try:
+            # Clear cooldowns older than max_cooldown_ms
+            cutoff_ts = current_ts - max_cooldown_ms
+            cursor = await self.db.execute(
+                "DELETE FROM cooldown_tracker WHERE last_alert_ts < ?",
+                (cutoff_ts,)
+            )
+            await self.db.commit()
+            deleted = cursor.rowcount
+            if deleted > 0:
+                logger.info(f"Cleared {deleted} expired cooldown(s) from database")
+            return deleted
+        except Exception as e:
+            logger.error(f"Error clearing expired cooldowns: {e}")
+            return 0
+
     async def check_cooldown(
         self,
         symbol: str,
@@ -490,8 +520,9 @@ class Storage:
         try:
             await self.db.execute("DELETE FROM bars_1m")
             await self.db.execute("DELETE FROM features")
+            await self.db.execute("DELETE FROM cooldown_tracker")
             await self.db.commit()
-            logger.info("Cleared all bars and features from database")
+            logger.info("Cleared all bars, features, and cooldowns from database")
         except Exception as e:
             logger.error(f"Error clearing database: {e}")
             await self.db.rollback()

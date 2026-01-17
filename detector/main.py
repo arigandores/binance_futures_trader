@@ -220,6 +220,13 @@ class AnomalyDetectorOrchestrator:
         # Initialize database
         await self.storage.init_db()
 
+        # Clear expired cooldowns from previous sessions
+        # (cooldowns older than max cooldown duration are definitely stale)
+        import time
+        current_ts = int(time.time() * 1000)
+        max_cooldown_ms = self.config.alerts.cooldown_minutes_per_symbol * 60 * 1000
+        await self.storage.clear_expired_cooldowns(current_ts, max_cooldown_ms)
+
         # Check if we need to backfill historical data
         await self._check_and_backfill()
 
