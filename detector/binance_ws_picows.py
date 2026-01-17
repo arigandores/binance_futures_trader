@@ -41,7 +41,7 @@ except ImportError:
 
 # Binance WebSocket limits
 MAX_STREAMS_PER_CONNECTION = 200
-MAX_SUBSCRIBE_BATCH = 200
+MAX_SUBSCRIBE_BATCH = 50  # Smaller batches for reliable subscription confirmation
 
 
 def get_websocket_client(symbols: List[str], tick_queue: asyncio.Queue, reconnect_delays: List[int] = None):
@@ -74,6 +74,7 @@ if PICOWS_AVAILABLE:
             self._subscribe_complete = asyncio.Event()
             self._pending_subscribe_ids: Dict[int, int] = {}  # id -> stream count
             self._confirmed_streams = 0
+            self._batch_confirmed = asyncio.Event()  # Signaled when a batch is confirmed
 
         def on_ws_connected(self, transport: WSTransport):
             """Called when WebSocket connection is established."""
@@ -87,15 +88,17 @@ if PICOWS_AVAILABLE:
             if not self._transport:
                 return
 
-            # Split into batches
+            # Split into smaller batches for reliable confirmation
             batches = [self.streams[i:i + MAX_SUBSCRIBE_BATCH]
                        for i in range(0, len(self.streams), MAX_SUBSCRIBE_BATCH)]
 
             total_streams = len(self.streams)
+            logger.info(f"[Conn {self.conn_id}] Subscribing to {total_streams} streams in {len(batches)} batches")
 
             for i, batch in enumerate(batches):
                 subscribe_id = self.client._get_subscribe_id()
                 self._pending_subscribe_ids[subscribe_id] = len(batch)
+                self._batch_confirmed.clear()
 
                 subscribe_msg = {
                     "method": "SUBSCRIBE",
@@ -103,28 +106,22 @@ if PICOWS_AVAILABLE:
                     "id": subscribe_id
                 }
                 self._transport.send(WSMsgType.TEXT, json_dumps(subscribe_msg).encode())
-                logger.info(f"[Conn {self.conn_id}] Sent subscribe batch {i+1}/{len(batches)} (id={subscribe_id}, {len(batch)} streams, pending_ids={list(self._pending_subscribe_ids.keys())})")
+                logger.debug(f"[Conn {self.conn_id}] Sent batch {i+1}/{len(batches)} (id={subscribe_id}, {len(batch)} streams)")
 
-                # Wait a bit between batches to avoid rate limiting
-                if i < len(batches) - 1:
-                    await asyncio.sleep(0.1)
+                # Wait for this batch's confirmation before sending next
+                try:
+                    await asyncio.wait_for(self._batch_confirmed.wait(), timeout=5.0)
+                    logger.debug(f"[Conn {self.conn_id}] Batch {i+1}/{len(batches)} confirmed")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[Conn {self.conn_id}] Batch {i+1}/{len(batches)} confirmation timeout (id={subscribe_id})")
+                    # Continue anyway - subscription might still work
 
-            # Wait for all confirmations (with timeout)
-            try:
-                for _ in range(50):  # Max 5 seconds total
-                    if self._confirmed_streams >= total_streams:
-                        break
-                    await asyncio.sleep(0.1)
-
-                if self._confirmed_streams >= total_streams:
-                    logger.info(f"[Conn {self.conn_id}] All {total_streams} streams confirmed")
-                else:
-                    logger.warning(f"[Conn {self.conn_id}] Only {self._confirmed_streams}/{total_streams} streams confirmed (continuing anyway)")
-            except Exception as e:
-                logger.warning(f"[Conn {self.conn_id}] Error waiting for confirmations: {e}")
+            if self._confirmed_streams >= total_streams:
+                logger.info(f"[Conn {self.conn_id}] All {total_streams} streams confirmed")
+            else:
+                logger.warning(f"[Conn {self.conn_id}] {self._confirmed_streams}/{total_streams} streams confirmed")
 
             self._subscribe_complete.set()
-            logger.info(f"[Conn {self.conn_id}] Subscription complete")
 
         def on_ws_frame(self, transport: WSTransport, frame: WSFrame):
             """Called for each received WebSocket frame."""
@@ -138,10 +135,11 @@ if PICOWS_AVAILABLE:
                         if sub_id in self._pending_subscribe_ids:
                             stream_count = self._pending_subscribe_ids.pop(sub_id)
                             self._confirmed_streams += stream_count
-                            logger.info(f"[Conn {self.conn_id}] Subscribe confirmed (id={sub_id}, +{stream_count} streams, total={self._confirmed_streams})")
+                            self._batch_confirmed.set()  # Signal that batch is confirmed
+                            logger.debug(f"[Conn {self.conn_id}] Subscribe confirmed (id={sub_id}, +{stream_count} streams, total={self._confirmed_streams})")
                         else:
                             # Log unexpected response for debugging
-                            logger.warning(f"[Conn {self.conn_id}] Unknown subscribe response: id={sub_id}, pending_ids={list(self._pending_subscribe_ids.keys())}, result={data.get('result')}")
+                            logger.debug(f"[Conn {self.conn_id}] Unknown subscribe response: id={sub_id}, pending_ids={list(self._pending_subscribe_ids.keys())}")
                         return
 
                     # Use create_task to avoid blocking the event loop
