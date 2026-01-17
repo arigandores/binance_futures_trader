@@ -303,6 +303,11 @@ class PositionManager:
             metadata=metadata
         )
 
+        # Update cooldown AFTER signal is accepted (not blocked by filters)
+        # This ensures cooldown only applies when user actually sees a signal
+        await self.storage.update_cooldown(symbol, event.direction, bar.ts_minute)
+        logger.debug(f"{symbol}: Cooldown updated after pending signal created")
+
     async def _check_pending_signals(self, symbol: str, bar: Bar) -> None:
         """
         Check if any pending signals for this symbol can trigger entry.
@@ -1076,6 +1081,11 @@ class PositionManager:
             ts=position.open_ts,
             metadata=audit_metadata
         )
+
+        # Update cooldown AFTER position is actually opened
+        # This ensures cooldown only applies when user sees a position
+        await self.storage.update_cooldown(symbol, event.direction, bar.ts_minute)
+        logger.debug(f"{symbol}: Cooldown updated after position opened directly")
 
     async def _update_excursions(self, bar: Bar) -> None:
         """Update MFE/MAE for open positions in this symbol."""

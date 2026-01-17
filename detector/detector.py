@@ -84,8 +84,9 @@ class AnomalyDetector:
             # Write to database
             await self.storage.write_event(event)
 
-            # Update cooldown
-            await self.storage.update_cooldown(features.symbol, features.direction, features.ts_minute)
+            # NOTE: Cooldown is updated by position_manager AFTER signal is accepted
+            # (not blocked by filters). This ensures cooldown only applies when
+            # a pending signal or position is actually created.
 
             logger.info(f"Initiator detected: {features.symbol} {features.direction.value}")
 
