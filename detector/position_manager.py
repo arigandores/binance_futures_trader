@@ -270,6 +270,29 @@ class PositionManager:
 
         # Send Telegram notification and save to audit log
         message = self._format_pending_signal_created(pending, event)
+
+        # Build comprehensive metadata for audit analysis
+        market_ctx = self._build_market_context(symbol, bar)
+        metadata = {
+            # Signal data
+            'signal_z_er': pending.signal_z_er,
+            'signal_z_vol': pending.signal_z_vol,
+            'signal_price': pending.signal_price,
+            'peak_since_signal': pending.peak_since_signal,
+            'event_id': event.event_id,
+            # Entry trigger settings
+            'max_wait_minutes': cfg.entry_trigger_max_wait_minutes,
+            'z_cooldown_threshold': cfg.entry_trigger_z_cooldown,
+            'pullback_threshold_pct': cfg.entry_trigger_pullback_pct,
+            'taker_stability_threshold': cfg.entry_trigger_taker_stability,
+            'min_taker_dominance': cfg.entry_trigger_min_taker_dominance,
+            # Event confirmation
+            'confirmation_status': event.metrics.get('confirmation_status', 'UNKNOWN'),
+            'confirmations': event.metrics.get('confirmations', []),
+            # Market context
+            **market_ctx
+        }
+
         await self._send_and_save_alert(
             alert_type="PENDING_SIGNAL_CREATED",
             symbol=pending.symbol,
@@ -277,12 +300,7 @@ class PositionManager:
             message=message,
             alert_id=f"pending_created_{pending.signal_id}",
             ts=pending.created_ts,
-            metadata={
-                'signal_z_er': pending.signal_z_er,
-                'signal_z_vol': pending.signal_z_vol,
-                'signal_price': pending.signal_price,
-                'event_id': event.event_id
-            }
+            metadata=metadata
         )
 
     async def _check_pending_signals(self, symbol: str, bar: Bar) -> None:
@@ -321,6 +339,29 @@ class PositionManager:
                         )
                         # Send Telegram notification and save to audit log
                         message = self._format_pending_signal_invalidated(pending)
+
+                        # Build comprehensive metadata for audit analysis
+                        market_ctx = self._build_market_context(pending.symbol, bar)
+                        metadata = {
+                            # Invalidation details
+                            'invalidation_reason': pending.invalidation_reason,
+                            'invalidation_details': pending.invalidation_details,
+                            # Signal data at creation
+                            'signal_z_er': pending.signal_z_er,
+                            'signal_z_vol': pending.signal_z_vol,
+                            'signal_price': pending.signal_price,
+                            'peak_since_signal': pending.peak_since_signal,
+                            # Timing
+                            'bars_since_signal': pending.bars_since_signal,
+                            'created_ts': pending.created_ts,
+                            'duration_seconds': (bar.ts_minute - pending.created_ts) // 1000,
+                            # Current state at invalidation
+                            'current_price': bar.close,
+                            'price_change_pct': ((bar.close - pending.signal_price) / pending.signal_price * 100) if pending.signal_price else None,
+                            # Market context
+                            **market_ctx
+                        }
+
                         await self._send_and_save_alert(
                             alert_type="PENDING_SIGNAL_INVALIDATED",
                             symbol=pending.symbol,
@@ -328,13 +369,7 @@ class PositionManager:
                             message=message,
                             alert_id=f"pending_invalidated_{pending.signal_id}_{bar.ts_minute}",
                             ts=bar.ts_minute,
-                            metadata={
-                                'invalidation_reason': pending.invalidation_reason,
-                                'invalidation_details': pending.invalidation_details,
-                                'bars_since_signal': pending.bars_since_signal,
-                                'signal_z_er': pending.signal_z_er,
-                                'signal_price': pending.signal_price
-                            }
+                            metadata=metadata
                         )
                     continue  # Skip to next pending
 
@@ -359,6 +394,32 @@ class PositionManager:
                         )
                         # Send Telegram notification and save to audit log
                         message = self._format_pending_signal_expired(pending, cfg.entry_trigger_max_wait_minutes)
+
+                        # Build comprehensive metadata for audit analysis
+                        market_ctx = self._build_market_context(pending.symbol, bar)
+                        metadata = {
+                            # Expiry details
+                            'max_wait_minutes': cfg.entry_trigger_max_wait_minutes,
+                            'expiry_reason': 'TTL_EXCEEDED',
+                            # Signal data at creation
+                            'signal_z_er': pending.signal_z_er,
+                            'signal_z_vol': pending.signal_z_vol,
+                            'signal_price': pending.signal_price,
+                            'peak_since_signal': pending.peak_since_signal,
+                            # Timing
+                            'bars_since_signal': pending.bars_since_signal,
+                            'created_ts': pending.created_ts,
+                            'duration_seconds': (bar.ts_minute - pending.created_ts) // 1000,
+                            # Current state at expiry
+                            'current_price': bar.close,
+                            'price_change_pct': ((bar.close - pending.signal_price) / pending.signal_price * 100) if pending.signal_price else None,
+                            'pullback_from_peak_pct': self._calculate_pullback_pct(pending, bar.close),
+                            # Why triggers not met (for analysis)
+                            'last_taker_share': bar.taker_buy_share(),
+                            # Market context
+                            **market_ctx
+                        }
+
                         await self._send_and_save_alert(
                             alert_type="PENDING_SIGNAL_EXPIRED",
                             symbol=pending.symbol,
@@ -366,12 +427,7 @@ class PositionManager:
                             message=message,
                             alert_id=f"pending_expired_{pending.signal_id}_{bar.ts_minute}",
                             ts=bar.ts_minute,
-                            metadata={
-                                'max_wait_minutes': cfg.entry_trigger_max_wait_minutes,
-                                'bars_since_signal': pending.bars_since_signal,
-                                'signal_z_er': pending.signal_z_er,
-                                'signal_price': pending.signal_price
-                            }
+                            metadata=metadata
                         )
                     continue
 
@@ -677,6 +733,69 @@ class PositionManager:
 
         # Send Telegram notification and save to audit log
         message = self._format_position_opened_from_pending(position)
+
+        # Calculate stop/target prices for audit
+        cfg = self.config.position_management
+        atr = self.extended_features.get_atr(symbol)
+        stop_price = None
+        target_price = None
+
+        if cfg.use_atr_stops and atr:
+            if event.direction == Direction.UP:
+                stop_price = bar.close - (atr * cfg.atr_stop_multiplier)
+                target_price = bar.close + (atr * cfg.atr_target_multiplier)
+            else:
+                stop_price = bar.close + (atr * cfg.atr_stop_multiplier)
+                target_price = bar.close - (atr * cfg.atr_target_multiplier)
+        else:
+            # Fixed percentage stops
+            if event.direction == Direction.UP:
+                stop_price = bar.close * (1 - cfg.stop_loss_percent / 100)
+                target_price = bar.close * (1 + cfg.take_profit_percent / 100)
+            else:
+                stop_price = bar.close * (1 + cfg.stop_loss_percent / 100)
+                target_price = bar.close * (1 - cfg.take_profit_percent / 100)
+
+        # Build comprehensive metadata for audit analysis
+        market_ctx = self._build_market_context(symbol, bar)
+        audit_metadata = {
+            # Position identification
+            'position_id': position.position_id,
+            'event_id': event.event_id,
+            'from_pending': True,
+            # Entry prices and metrics
+            'open_price': position.open_price,
+            'entry_z_er': position.entry_z_er,
+            'entry_z_vol': position.entry_z_vol,
+            'entry_taker_share': position.entry_taker_share,
+            # Signal data (from pending)
+            'signal_price': pending.signal_price,
+            'signal_z_er': pending.signal_z_er,
+            'signal_z_vol': pending.signal_z_vol,
+            'peak_since_signal': pending.peak_since_signal,
+            # Trigger timing
+            'trigger_delay_bars': metrics.get('trigger_delay_bars', 0),
+            'trigger_delay_seconds_approx': metrics.get('trigger_delay_seconds_approx', 0),
+            # Entry quality analysis
+            'entry_pullback_pct': self._calculate_pullback_pct(pending, bar.close),
+            'entry_reason_details': entry_details,
+            # Exit settings (for comparison with actual exit)
+            'stop_loss_price': stop_price,
+            'take_profit_price': target_price,
+            'atr': atr,
+            'atr_stop_multiplier': cfg.atr_stop_multiplier if cfg.use_atr_stops else None,
+            'atr_target_multiplier': cfg.atr_target_multiplier if cfg.use_atr_stops else None,
+            'stop_loss_percent': cfg.stop_loss_percent,
+            'take_profit_percent': cfg.take_profit_percent,
+            'max_hold_minutes': cfg.max_hold_minutes,
+            'use_trailing_stop': cfg.use_trailing_stop,
+            # Confirmation
+            'confirmation_status': event.metrics.get('confirmation_status', 'UNKNOWN'),
+            'confirmations': event.metrics.get('confirmations', []),
+            # Market context
+            **market_ctx
+        }
+
         await self._send_and_save_alert(
             alert_type="POSITION_OPENED",
             symbol=position.symbol,
@@ -684,15 +803,7 @@ class PositionManager:
             message=message,
             alert_id=f"position_opened_{position.position_id}",
             ts=position.open_ts,
-            metadata={
-                'position_id': position.position_id,
-                'open_price': position.open_price,
-                'entry_z_er': position.entry_z_er,
-                'entry_z_vol': position.entry_z_vol,
-                'trigger_delay_bars': metrics.get('trigger_delay_bars', 0),
-                'entry_reason_details': entry_details,
-                'from_pending': True
-            }
+            metadata=audit_metadata
         )
 
     def _generate_entry_reason_details(self, pending: PendingSignal, bar: Bar) -> str:
@@ -781,6 +892,36 @@ class PositionManager:
                         )
                         # Send Telegram notification and save to audit log
                         message = self._format_pending_signal_expired(pending, self.config.position_management.entry_trigger_max_wait_minutes)
+
+                        # Get bar for this symbol if available
+                        bar = self.latest_bars.get(pending.symbol)
+                        current_price = bar.close if bar else None
+
+                        # Build comprehensive metadata for audit analysis
+                        market_ctx = self._build_market_context(pending.symbol, bar)
+                        metadata = {
+                            # Expiry details
+                            'max_wait_minutes': self.config.position_management.entry_trigger_max_wait_minutes,
+                            'expiry_reason': 'CLEANUP_TTL_EXCEEDED',
+                            # Signal data at creation
+                            'signal_z_er': pending.signal_z_er,
+                            'signal_z_vol': pending.signal_z_vol,
+                            'signal_price': pending.signal_price,
+                            'peak_since_signal': pending.peak_since_signal,
+                            # Timing
+                            'bars_since_signal': pending.bars_since_signal,
+                            'created_ts': pending.created_ts,
+                            'duration_seconds': (max_bar_ts - pending.created_ts) // 1000,
+                            # Current state at expiry
+                            'current_price': current_price,
+                            'price_change_pct': ((current_price - pending.signal_price) / pending.signal_price * 100) if (current_price and pending.signal_price) else None,
+                            'pullback_from_peak_pct': self._calculate_pullback_pct(pending, current_price) if current_price else None,
+                            # Why triggers not met (for analysis)
+                            'last_taker_share': bar.taker_buy_share() if bar else None,
+                            # Market context
+                            **market_ctx
+                        }
+
                         await self._send_and_save_alert(
                             alert_type="PENDING_SIGNAL_EXPIRED",
                             symbol=pending.symbol,
@@ -788,12 +929,7 @@ class PositionManager:
                             message=message,
                             alert_id=f"pending_expired_cleanup_{pending.signal_id}_{max_bar_ts}",
                             ts=max_bar_ts,
-                            metadata={
-                                'max_wait_minutes': self.config.position_management.entry_trigger_max_wait_minutes,
-                                'bars_since_signal': pending.bars_since_signal,
-                                'signal_z_er': pending.signal_z_er,
-                                'signal_price': pending.signal_price
-                            }
+                            metadata=metadata
                         )
 
     async def _open_position(self, event: Event) -> None:
@@ -875,6 +1011,62 @@ class PositionManager:
 
         # Send Telegram notification and save to audit log
         message = self._format_position_opened(position)
+
+        # Calculate stop/target prices for audit
+        cfg = self.config.position_management
+        atr = self.extended_features.get_atr(symbol)
+        stop_price = None
+        target_price = None
+
+        if cfg.use_atr_stops and atr:
+            if event.direction == Direction.UP:
+                stop_price = bar.close - (atr * cfg.atr_stop_multiplier)
+                target_price = bar.close + (atr * cfg.atr_target_multiplier)
+            else:
+                stop_price = bar.close + (atr * cfg.atr_stop_multiplier)
+                target_price = bar.close - (atr * cfg.atr_target_multiplier)
+        else:
+            # Fixed percentage stops
+            if event.direction == Direction.UP:
+                stop_price = bar.close * (1 - cfg.stop_loss_percent / 100)
+                target_price = bar.close * (1 + cfg.take_profit_percent / 100)
+            else:
+                stop_price = bar.close * (1 + cfg.stop_loss_percent / 100)
+                target_price = bar.close * (1 - cfg.take_profit_percent / 100)
+
+        # Build comprehensive metadata for audit analysis
+        market_ctx = self._build_market_context(symbol, bar)
+        audit_metadata = {
+            # Position identification
+            'position_id': position.position_id,
+            'event_id': event.event_id,
+            'from_pending': False,
+            # Entry prices and metrics
+            'open_price': position.open_price,
+            'entry_z_er': position.entry_z_er,
+            'entry_z_vol': position.entry_z_vol,
+            'entry_taker_share': position.entry_taker_share,
+            # Exit settings (for comparison with actual exit)
+            'stop_loss_price': stop_price,
+            'take_profit_price': target_price,
+            'atr': atr,
+            'atr_stop_multiplier': cfg.atr_stop_multiplier if cfg.use_atr_stops else None,
+            'atr_target_multiplier': cfg.atr_target_multiplier if cfg.use_atr_stops else None,
+            'stop_loss_percent': cfg.stop_loss_percent,
+            'take_profit_percent': cfg.take_profit_percent,
+            'max_hold_minutes': cfg.max_hold_minutes,
+            'use_trailing_stop': cfg.use_trailing_stop,
+            # Confirmation
+            'confirmation_status': event.metrics.get('confirmation_status', 'UNKNOWN'),
+            'confirmations': event.metrics.get('confirmations', []),
+            # Dynamic targets calculated
+            'dynamic_stop_loss': targets.get('stop_loss_percent') if targets else None,
+            'dynamic_take_profit': targets.get('take_profit_percent') if targets else None,
+            'risk_reward_ratio': targets.get('risk_reward_ratio') if targets else None,
+            # Market context
+            **market_ctx
+        }
+
         await self._send_and_save_alert(
             alert_type="POSITION_OPENED",
             symbol=position.symbol,
@@ -882,13 +1074,7 @@ class PositionManager:
             message=message,
             alert_id=f"position_opened_{position.position_id}",
             ts=position.open_ts,
-            metadata={
-                'position_id': position.position_id,
-                'open_price': position.open_price,
-                'entry_z_er': position.entry_z_er,
-                'entry_z_vol': position.entry_z_vol,
-                'from_pending': False
-            }
+            metadata=audit_metadata
         )
 
     async def _update_excursions(self, bar: Bar) -> None:
@@ -1631,6 +1817,42 @@ class PositionManager:
 
             # Send Telegram notification and save to audit log
             message = self._format_partial_profit_executed(position, current_price, current_pnl_pct)
+
+            # Get bar for market context
+            bar = self.latest_bars.get(position.symbol)
+
+            # Build comprehensive metadata for audit analysis
+            market_ctx = self._build_market_context(position.symbol, bar)
+            audit_metadata = {
+                # Position identification
+                'position_id': position.position_id,
+                'event_id': position.event_id,
+                # Entry data
+                'open_price': position.open_price,
+                'open_ts': position.open_ts,
+                'entry_z_er': position.entry_z_er,
+                'entry_z_vol': position.entry_z_vol,
+                # Partial profit execution
+                'partial_profit_price': current_price,
+                'partial_profit_pnl_percent': current_pnl_pct,
+                'target_pnl_percent': target_distance_pct,
+                # Time to partial profit
+                'time_to_partial_profit_ms': bar_ts - position.open_ts,
+                'time_to_partial_profit_minutes': (bar_ts - position.open_ts) // 60000,
+                # ATR data
+                'atr': atr,
+                'partial_profit_target_atr': profile.partial_profit_target_atr,
+                # Stop loss management
+                'breakeven_stop_active': position.metrics.get('breakeven_stop_active', False),
+                'breakeven_stop_price': position.metrics.get('breakeven_stop_price'),
+                'partial_profit_move_sl_breakeven': profile.partial_profit_move_sl_breakeven,
+                # Current position state
+                'max_favorable_excursion': position.max_favorable_excursion,
+                'max_adverse_excursion': position.max_adverse_excursion,
+                # Market context
+                **market_ctx
+            }
+
             await self._send_and_save_alert(
                 alert_type="PARTIAL_PROFIT_EXECUTED",
                 symbol=position.symbol,
@@ -1638,13 +1860,7 @@ class PositionManager:
                 message=message,
                 alert_id=f"partial_profit_{position.position_id}_{bar_ts}",
                 ts=bar_ts,
-                metadata={
-                    'position_id': position.position_id,
-                    'partial_profit_price': current_price,
-                    'partial_profit_pnl_percent': current_pnl_pct,
-                    'target_pnl_percent': target_distance_pct,
-                    'breakeven_stop_active': position.metrics.get('breakeven_stop_active', False)
-                }
+                metadata=audit_metadata
             )
 
             return True
@@ -2010,6 +2226,60 @@ class PositionManager:
 
         # Send Telegram notification and save to audit log
         message = self._format_position_closed(position)
+
+        # Get ATR at exit for comparison with entry
+        atr_at_exit = self.extended_features.get_atr(position.symbol)
+
+        # Calculate BTC performance during position hold time for comparison
+        btc_pnl_percent = None
+        btc_bar = self.latest_bars.get('BTCUSDT')
+        # We'd need to store BTC price at entry to calculate this properly,
+        # but for now we can use features if available
+
+        # Build comprehensive metadata for audit analysis
+        market_ctx = self._build_market_context(position.symbol, bar)
+        audit_metadata = {
+            # Position identification
+            'position_id': position.position_id,
+            'event_id': position.event_id,
+            # Entry data (from position)
+            'open_price': position.open_price,
+            'open_ts': position.open_ts,
+            'entry_z_er': position.entry_z_er,
+            'entry_z_vol': position.entry_z_vol,
+            'entry_taker_share': position.entry_taker_share,
+            # Exit data
+            'close_price': position.close_price,
+            'close_ts': position.close_ts,
+            'exit_z_er': position.exit_z_er,
+            'exit_z_vol': position.exit_z_vol,
+            'exit_taker_share': bar.taker_buy_share(),
+            # Performance metrics
+            'pnl_percent': position.pnl_percent,
+            'max_favorable_excursion': position.max_favorable_excursion,
+            'max_adverse_excursion': position.max_adverse_excursion,
+            'mfe_to_pnl_ratio': (position.max_favorable_excursion / position.pnl_percent) if position.pnl_percent and position.pnl_percent != 0 else None,
+            # Timing
+            'duration_minutes': position.duration_minutes,
+            'bars_held': position.duration_minutes,  # Approximate
+            # Exit analysis
+            'exit_reason': exit_reason.value,
+            'exit_reason_details': exit_details,
+            # ATR comparison
+            'atr_at_exit': atr_at_exit,
+            'atr_at_entry': position.metrics.get('atr'),
+            # Trailing stop data (if used)
+            'trailing_stop_active': position.metrics.get('trailing_stop_active', False),
+            'trailing_stop_price': position.metrics.get('trailing_stop_price'),
+            'partial_profit_taken': position.metrics.get('partial_profit_taken', False),
+            'breakeven_stop_active': position.metrics.get('breakeven_stop_active', False),
+            # Original entry settings (for comparison)
+            'original_stop_loss_price': position.metrics.get('stop_loss_price'),
+            'original_take_profit_price': position.metrics.get('take_profit_price'),
+            # Market context at exit
+            **market_ctx
+        }
+
         await self._send_and_save_alert(
             alert_type="POSITION_CLOSED",
             symbol=position.symbol,
@@ -2017,17 +2287,7 @@ class PositionManager:
             message=message,
             alert_id=f"position_closed_{position.position_id}",
             ts=position.close_ts,
-            metadata={
-                'position_id': position.position_id,
-                'open_price': position.open_price,
-                'close_price': position.close_price,
-                'pnl_percent': position.pnl_percent,
-                'exit_reason': exit_reason.value,
-                'exit_reason_details': exit_details,
-                'duration_minutes': position.duration_minutes,
-                'max_favorable_excursion': position.max_favorable_excursion,
-                'max_adverse_excursion': position.max_adverse_excursion
-            }
+            metadata=audit_metadata
         )
 
     async def _send_telegram(self, message: str) -> None:
@@ -2092,6 +2352,100 @@ class PositionManager:
             message_text=message,
             metadata=metadata
         )
+
+    def _build_market_context(self, symbol: str, bar: Optional[Bar] = None) -> dict:
+        """
+        Build market context dict for audit logging.
+
+        Collects BTC data, ATR, profile and other contextual information
+        needed for comprehensive analysis of trading decisions.
+
+        Args:
+            symbol: Trading symbol
+            bar: Current bar (optional, will use latest_bars if not provided)
+
+        Returns:
+            Dict with market context data
+        """
+        context = {
+            'profile': self.config.position_management.profile,
+        }
+
+        # Get bar if not provided
+        if bar is None:
+            bar = self.latest_bars.get(symbol)
+
+        # Symbol data
+        if bar:
+            context['price'] = bar.close
+            context['volume'] = bar.volume
+            context['notional'] = bar.notional
+            context['trades'] = bar.trades
+            context['taker_buy_share'] = bar.taker_buy_share()
+            context['funding'] = bar.funding
+            context['oi'] = bar.oi
+
+        # Symbol features
+        features = self.latest_features.get(symbol)
+        if features:
+            context['z_er'] = features.z_er_15m
+            context['z_vol'] = features.z_vol_15m
+            context['beta'] = features.beta
+            context['er_15m'] = features.er_15m
+
+        # ATR
+        atr = self.extended_features.get_atr(symbol)
+        if atr:
+            context['atr'] = atr
+            if bar and bar.close > 0:
+                context['atr_percent'] = (atr / bar.close) * 100
+
+        # BTC context (benchmark)
+        btc_bar = self.latest_bars.get('BTCUSDT')
+        btc_features = self.latest_features.get('BTCUSDT')
+
+        if btc_bar:
+            context['btc_price'] = btc_bar.close
+            context['btc_taker_buy_share'] = btc_bar.taker_buy_share()
+
+        if btc_features:
+            context['btc_z_er'] = btc_features.z_er_15m
+            context['btc_z_vol'] = btc_features.z_vol_15m
+            # Check if BTC is in anomaly state
+            btc_in_anomaly = (
+                abs(btc_features.z_er_15m or 0) >= 3.0 and
+                (btc_features.z_vol_15m or 0) >= 3.0
+            )
+            context['btc_in_anomaly'] = btc_in_anomaly
+
+        # BTC ATR
+        btc_atr = self.extended_features.get_atr('BTCUSDT')
+        if btc_atr:
+            context['btc_atr'] = btc_atr
+
+        return context
+
+    def _calculate_pullback_pct(self, pending: PendingSignal, current_price: float) -> Optional[float]:
+        """
+        Calculate pullback percentage from peak since signal.
+
+        For LONG: pullback = (peak - current) / peak * 100
+        For SHORT: pullback = (current - peak) / peak * 100
+
+        Args:
+            pending: PendingSignal with peak_since_signal
+            current_price: Current price
+
+        Returns:
+            Pullback percentage or None if peak not available
+        """
+        if not pending.peak_since_signal or pending.peak_since_signal == 0:
+            return None
+
+        if pending.direction == Direction.UP:
+            return (pending.peak_since_signal - current_price) / pending.peak_since_signal * 100
+        else:
+            return (current_price - pending.peak_since_signal) / pending.peak_since_signal * 100
 
     def _format_position_opened(self, position: Position) -> str:
         """Format message for position opened (immediate entry, no triggers)."""
