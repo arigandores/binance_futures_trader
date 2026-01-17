@@ -103,7 +103,7 @@ if PICOWS_AVAILABLE:
                     "id": subscribe_id
                 }
                 self._transport.send(WSMsgType.TEXT, json_dumps(subscribe_msg).encode())
-                logger.debug(f"[Conn {self.conn_id}] Sent subscribe batch {i+1}/{len(batches)} (id={subscribe_id}, {len(batch)} streams)")
+                logger.info(f"[Conn {self.conn_id}] Sent subscribe batch {i+1}/{len(batches)} (id={subscribe_id}, {len(batch)} streams, pending_ids={list(self._pending_subscribe_ids.keys())})")
 
                 # Wait a bit between batches to avoid rate limiting
                 if i < len(batches) - 1:
@@ -133,12 +133,15 @@ if PICOWS_AVAILABLE:
                     data = json_loads(frame.get_payload_as_bytes())
 
                     # Handle subscription confirmations
-                    if 'id' in data and 'result' in data:
+                    if 'id' in data:
                         sub_id = data.get('id')
                         if sub_id in self._pending_subscribe_ids:
                             stream_count = self._pending_subscribe_ids.pop(sub_id)
                             self._confirmed_streams += stream_count
-                            logger.debug(f"[Conn {self.conn_id}] Subscribe confirmed (id={sub_id}, +{stream_count} streams, total={self._confirmed_streams})")
+                            logger.info(f"[Conn {self.conn_id}] Subscribe confirmed (id={sub_id}, +{stream_count} streams, total={self._confirmed_streams})")
+                        else:
+                            # Log unexpected response for debugging
+                            logger.warning(f"[Conn {self.conn_id}] Unknown subscribe response: id={sub_id}, pending_ids={list(self._pending_subscribe_ids.keys())}, result={data.get('result')}")
                         return
 
                     # Use create_task to avoid blocking the event loop
