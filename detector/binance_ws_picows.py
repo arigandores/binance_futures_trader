@@ -205,7 +205,9 @@ if PICOWS_AVAILABLE:
                     listener = BinanceWSListener(self, conn_id, streams)
                     self._listeners.append(listener)
 
-                    transport, _ = await ws_connect(listener, self.BASE_URL)
+                    # picows requires a factory function (callable), not an instance
+                    # Use default argument to capture listener value (avoids closure issue)
+                    transport, _ = await ws_connect(lambda l=listener: l, self.BASE_URL)
                     self.is_connected = True
                     delay_index = 0
 
