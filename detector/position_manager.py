@@ -376,6 +376,11 @@ class PositionManager:
                             ts=bar.ts_minute,
                             metadata=metadata
                         )
+
+                        # Clear cooldown since no position was opened
+                        # This allows new signals to be accepted immediately
+                        if await self.storage.clear_cooldown(pending.symbol):
+                            logger.info(f"{pending.symbol}: Cooldown cleared after signal invalidation")
                     continue  # Skip to next pending
 
                 # Must-Fix #10: Only increment bars_since_signal ONCE per bar (idempotent)
@@ -434,6 +439,11 @@ class PositionManager:
                             ts=bar.ts_minute,
                             metadata=metadata
                         )
+
+                        # Clear cooldown since no position was opened
+                        # This allows new signals to be accepted immediately
+                        if await self.storage.clear_cooldown(pending.symbol):
+                            logger.info(f"{pending.symbol}: Cooldown cleared after signal expiry")
                     continue
 
                 # Check min_wait_bars (optional filter to avoid same-bar entry)
@@ -936,6 +946,11 @@ class PositionManager:
                             ts=max_bar_ts,
                             metadata=metadata
                         )
+
+                        # Clear cooldown since no position was opened
+                        # This allows new signals to be accepted immediately
+                        if await self.storage.clear_cooldown(pending.symbol):
+                            logger.info(f"{pending.symbol}: Cooldown cleared after signal expiry (cleanup)")
 
     async def _open_position(self, event: Event) -> None:
         """
@@ -2299,6 +2314,11 @@ class PositionManager:
             ts=position.close_ts,
             metadata=audit_metadata
         )
+
+        # Clear cooldown after position closes
+        # This allows new signals to be accepted immediately for this symbol
+        if await self.storage.clear_cooldown(position.symbol):
+            logger.info(f"{position.symbol}: Cooldown cleared after position closed")
 
     async def _send_telegram(self, message: str) -> None:
         """Send Telegram notification."""

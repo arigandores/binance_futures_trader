@@ -397,6 +397,30 @@ class Storage:
         except Exception as e:
             logger.error(f"Error updating cooldown for {symbol}: {e}")
 
+    async def clear_cooldown(self, symbol: str) -> bool:
+        """
+        Clear cooldown for a specific symbol.
+
+        Used when a pending signal is invalidated or expired without
+        opening a position - allows new signals to be accepted immediately.
+
+        Returns:
+            True if cooldown was cleared, False otherwise
+        """
+        if not self.db:
+            return False
+
+        try:
+            cursor = await self.db.execute(
+                "DELETE FROM cooldown_tracker WHERE symbol = ?",
+                (symbol,)
+            )
+            await self.db.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error clearing cooldown for {symbol}: {e}")
+            return False
+
     async def clear_expired_cooldowns(self, current_ts: int, max_cooldown_ms: int) -> int:
         """
         Clear cooldown entries that have definitely expired.
