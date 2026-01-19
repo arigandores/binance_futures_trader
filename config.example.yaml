@@ -239,6 +239,159 @@ position_management:
   # | Expected Trade Frequency     | 100%    | 50-70%       | -30-50%      |
   # =====================================================================
 
+# ===========================================================================
+# HYBRID STRATEGY CONFIGURATION (NEW)
+# ===========================================================================
+# The hybrid strategy dynamically selects between three trading modes based on
+# signal strength (z-score magnitude). This solves the core problem of trying
+# to trade mean-reversion patterns as momentum.
+#
+# Signal Classification:
+#   - EXTREME_SPIKE (z >= 5.0): Mean-Reversion mode - FADE the move
+#   - STRONG_SIGNAL (3.0-5.0): Conditional Momentum - need confirmation
+#   - EARLY_SIGNAL (1.5-3.0): Early Momentum - wait for continuation
+#
+# Key Innovation: For extreme moves (z >= 5σ), trade AGAINST the anomaly
+# (mean-reversion) because statistically extreme moves revert. For moderate
+# moves, follow the momentum but require confirmation first.
+# ===========================================================================
+
+hybrid_strategy:
+  enabled: false  # Master switch - set to true to enable hybrid strategy
+
+  # Signal Classification Thresholds
+  extreme_spike_threshold: 5.0    # z >= 5.0 = EXTREME_SPIKE (mean-reversion)
+  strong_signal_min: 3.0          # z >= 3.0 = STRONG_SIGNAL (conditional momentum)
+  early_signal_min: 1.5           # z >= 1.5 = EARLY_SIGNAL (wait for continuation)
+
+  # =========================================================================
+  # EXTREME_SPIKE Mode: Mean-Reversion (Fade the Move)
+  # =========================================================================
+  # For extreme z-scores (>= 5σ), statistically price will revert to mean.
+  # Trade AGAINST the direction of the spike.
+  # Example: z = +7.0 (extreme up move) → SHORT (fade the overbought spike)
+  #
+  # Entry: Wait for reversal signs (z dropping, volume fading, price confirming)
+  # Exit: Quick scalps with tight targets (1x ATR TP, 1.2x ATR SL)
+  mean_reversion:
+    # Entry Triggers - wait for reversal confirmation
+    reversal_z_drop_pct: 0.20           # Z must drop 20% from signal for entry
+    min_bars_before_entry: 2            # Minimum 2 bars before entry allowed
+    max_bars_before_expiry: 8           # TTL: max 8 bars to find entry
+    require_price_confirmation: true    # Price must move in trade_direction
+    require_volume_fade: true           # Volume must be declining
+
+    # Invalidation Conditions
+    invalidate_on_z_growth: true        # Invalidate if z continues growing
+    z_growth_invalidate_threshold: 1.10 # If z grows 10% more, invalidate
+    max_volume_growth_bars: 3           # Invalidate if volume grows N bars straight
+
+    # Exit Parameters - quick scalps
+    atr_target_multiplier: 1.0          # Quick TP: 1x ATR
+    atr_stop_multiplier: 1.2            # Slightly wider stop: 1.2x ATR
+    max_hold_minutes: 20                # Short holds for mean-reversion
+    z_score_exit_threshold: 1.5         # Exit when z normalizes
+    use_trailing_stop: false            # No trailing for quick scalps
+    use_z_exit: true                    # Use z-score exit
+
+  # =========================================================================
+  # STRONG_SIGNAL Mode: Conditional Momentum
+  # =========================================================================
+  # For z-scores 3.0-5.0, could be start of big move OR reversal point.
+  # Require additional confirmation before entering.
+  #
+  # Entry: Need no divergence, volume maintained, strong taker, stable z
+  # Mode Switch: If momentum fails, switch to mean-reversion instead
+  conditional_momentum:
+    # Confirmation Requirements - ALL must be met
+    min_taker_dominance: 0.70           # 70% buyers for LONG, 30% for SHORT
+    min_volume_retention: 0.90          # Volume must not drop more than 10%
+    max_z_variance_pct: 0.25            # Z variance must be < 25% of signal_z
+    require_no_divergence: true         # Price and z must move together
+    confirmation_bars: 3                # Need 3 bars for stability check
+    max_wait_bars: 10                   # TTL: max 10 bars
+
+    # Mode Switch Conditions (switch to mean-reversion if momentum fails)
+    enable_mode_switch: true            # Allow switching to MR mode
+    mode_switch_z_drop_pct: 0.30        # If z drops 30%, switch to MR
+    mode_switch_taker_reversal: 0.50    # If taker crosses 50%, switch
+    mode_switch_price_reversal: true    # If price reverses past signal, switch
+
+    # Exit Parameters - balanced
+    atr_target_multiplier: 2.0          # Standard TP: 2x ATR
+    atr_stop_multiplier: 1.5            # Standard SL: 1.5x ATR
+    max_hold_minutes: 45                # Medium holds
+    z_score_exit_threshold: 0.8         # Exit when momentum weakens
+    use_trailing_stop: true             # Enable trailing
+    trailing_stop_activation_atr: 1.0   # Activate at +1 ATR
+    trailing_stop_distance_atr: 0.8     # Trail at 0.8 ATR
+    use_z_exit: true                    # Use z-score exit
+
+  # =========================================================================
+  # EARLY_SIGNAL Mode: Wait for Continuation
+  # =========================================================================
+  # For z-scores 1.5-3.0, anomaly just starting. Wait for confirmation
+  # that the move is BUILDING, not fading.
+  #
+  # Entry: Wait 3-5 bars, need z growth, price follow-through, sustained volume
+  # Potential: Catch beginning of big moves for larger profits
+  early_momentum:
+    # Continuation Criteria - must see momentum building
+    min_z_growth_pct: 0.30              # Z must grow 30% from signal
+    min_price_follow_through_pct: 0.15  # Price must move 0.15% in direction
+    volume_must_sustain: true           # Volume must not decline
+    min_taker_persistence: 0.55         # Min taker over last 3 bars (55% for LONG)
+
+    # Timing
+    min_wait_bars: 3                    # Must wait at least 3 bars
+    max_wait_bars: 5                    # TTL: 5 bars
+
+    # Invalidation
+    z_decline_invalidate_pct: 0.20      # If z drops 20%, invalidate (momentum died)
+
+    # Exit Parameters - long holds for big moves
+    atr_target_multiplier: 3.0          # Wide target: 3x ATR
+    atr_stop_multiplier: 1.5            # Standard stop: 1.5x ATR
+    max_hold_minutes: 90                # Long holds
+    use_trailing_stop: true             # Enable trailing
+    trailing_stop_activation_atr: 1.5   # Activate later at +1.5 ATR
+    trailing_stop_distance_atr: 1.0     # Wider trail: 1 ATR
+    use_partial_profit: true            # Take partial at 1.5 ATR
+    partial_profit_target_atr: 1.5      # Partial target
+    partial_profit_percent: 0.50        # Close 50%
+    use_z_exit: false                   # Don't exit on z - let it run
+
+  # =========================================================================
+  # Common Settings (all modes)
+  # =========================================================================
+  common:
+    # Volume filter for all signals
+    min_volume_z_for_signal: 1.5        # Minimum vol_z for any signal
+
+    # Taker thresholds (used in classification)
+    taker_bullish_threshold: 0.55       # >55% = bullish flow
+    taker_bearish_threshold: 0.45       # <45% = bearish flow
+    taker_extreme_bullish: 0.70         # >70% = strong bullish
+    taker_extreme_bearish: 0.30         # <30% = strong bearish
+
+    # Position limits
+    max_positions_total: 5              # Maximum open positions
+    max_positions_per_mode: 2           # Maximum positions per mode
+
+  # =========================================================================
+  # Expected Performance by Mode
+  # =========================================================================
+  # | Mode                | Entry Rate | Win Rate | Avg P/L  | Hold Time |
+  # |---------------------|------------|----------|----------|-----------|
+  # | MEAN_REVERSION      | 40-60%     | 55-65%   | +0.3-0.5%| 5-20 min  |
+  # | CONDITIONAL_MOMENTUM| 15-25%     | 45-55%   | +0.6-1.0%| 15-45 min |
+  # | EARLY_MOMENTUM      | 20-35%     | 40-50%   | +1.0-2.0%| 30-90 min |
+  # =========================================================================
+  #
+  # Note: Mean-reversion has higher entry rate because reversal signs are easier
+  # to detect than continuation confirmation. Win rate is higher due to
+  # statistical advantage of extreme move reversion.
+
 runtime:
   log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
   rest_poll_sec: 60

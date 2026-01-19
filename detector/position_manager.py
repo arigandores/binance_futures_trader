@@ -9,7 +9,7 @@ from datetime import datetime
 from detector.utils import format_price
 from detector.models import (
     Event, Features, Bar, Position, PositionStatus, ExitReason, Direction,
-    PendingSignal
+    PendingSignal, SignalClass, TradingMode
 )
 from detector.storage import Storage
 from detector.features_extended import ExtendedFeatureCalculator
@@ -218,10 +218,48 @@ class PositionManager:
             return
 
         # =====================================================================
-        # WIN_RATE_MAX: Market regime filters (Step 4.1 integration)
+        # HYBRID STRATEGY: Determine signal class first (needed for class-aware filters)
+        # =====================================================================
+        hs_cfg = self.config.hybrid_strategy
+
+        if hs_cfg.enabled and event.signal_class is not None:
+            # Hybrid mode: set up based on signal class
+            signal_class = event.signal_class
+            trading_mode, trade_direction = self._get_trading_mode_and_direction(
+                signal_class, event.direction
+            )
+
+            # Mode-specific TTL
+            if signal_class == SignalClass.EXTREME_SPIKE:
+                max_wait_bars = hs_cfg.mean_reversion.max_bars_before_expiry
+            elif signal_class == SignalClass.STRONG_SIGNAL:
+                max_wait_bars = hs_cfg.conditional_momentum.max_wait_bars
+            else:  # EARLY_SIGNAL
+                max_wait_bars = hs_cfg.early_momentum.max_wait_bars
+
+            max_wait_ms = max_wait_bars * 60 * 1000  # 1 bar = 1 minute
+        else:
+            # Legacy mode
+            signal_class = None
+            trading_mode = None
+            trade_direction = event.direction
+            max_wait_ms = cfg.entry_trigger_max_wait_minutes * 60 * 1000
+
+        # =====================================================================
+        # FILTERS: Class-aware (hybrid) OR WIN_RATE_MAX (legacy)
         # Run BEFORE creating pending signal to filter out bad market conditions
         # =====================================================================
-        if self.config.position_management.profile == "WIN_RATE_MAX":
+
+        # Option 1: Class-aware filters (hybrid strategy)
+        if hs_cfg.enabled and hs_cfg.class_aware_filters.enabled and signal_class is not None:
+            passed, block_reason = self._apply_class_aware_filters(symbol, signal_class, bar)
+            if not passed:
+                # Logging already done in _apply_class_aware_filters
+                return
+            logger.debug(f"{symbol}: Class-aware filters PASSED for {signal_class.value}")
+
+        # Option 2: Legacy WIN_RATE_MAX filters (if class-aware disabled)
+        elif self.config.position_management.profile == "WIN_RATE_MAX":
             # Check BTC anomaly filter
             if not self._check_btc_anomaly_filter(symbol):
                 logger.info(f"{symbol}: Pending signal blocked by BTC anomaly filter")
@@ -241,9 +279,9 @@ class PositionManager:
 
         # Create pending signal with TTL (max watch window)
         # Must-Fix #1: Use bar time scale, not event.ts or wall clock
-        max_wait_ms = cfg.entry_trigger_max_wait_minutes * 60 * 1000
         signal_id = f"{symbol}_{event.event_id}_{event.direction.value}"  # Must-Fix #8: Use event.event_id
 
+        # NOTE: signal_class, trading_mode, trade_direction, max_wait_ms already determined above
         pending = PendingSignal(
             signal_id=signal_id,
             event=event,
@@ -255,18 +293,46 @@ class PositionManager:
             signal_z_vol=event.metrics.get('z_vol', 0),
             signal_price=bar.close,
             bars_since_signal=0,  # Track how many bars passed
-            peak_since_signal=bar.high if event.direction == Direction.UP else bar.low  # Must-Fix #3
+            peak_since_signal=bar.high if event.direction == Direction.UP else bar.low,  # Must-Fix #3
+            # HYBRID STRATEGY fields
+            signal_class=signal_class,
+            trading_mode=trading_mode,
+            trade_direction=trade_direction,
+            original_direction=event.direction,
         )
+
+        # Set original_price in event if not set
+        if event.original_price is None:
+            event.original_price = bar.close
+
+        # Initialize history arrays with initial values (Critical for helper methods)
+        pending.z_history.append(pending.signal_z_er)
+        pending.vol_history.append(pending.signal_z_vol)
+        if event.original_taker_share is not None:
+            pending.taker_history.append(event.original_taker_share)
+        pending.price_history.append(bar.close)
 
         self.pending_signals[signal_id] = pending
 
-        logger.info(
-            f"Pending signal created: {signal_id} | {symbol} {event.direction.value} "
-            f"@ {bar.close:.2f} | z_ER: {pending.signal_z_er:.2f} | "
-            f"Peak since signal: {pending.peak_since_signal:.2f} | "
-            f"Watch window: up to {cfg.entry_trigger_max_wait_minutes}m "
-            f"(will enter AS SOON AS triggers met)"
-        )
+        # Log message based on mode
+        if hs_cfg.enabled and signal_class:
+            mode_str = trading_mode.value if trading_mode else "UNKNOWN"
+            trade_dir_str = trade_direction.value if trade_direction else event.direction.value
+            logger.info(
+                f"HYBRID pending signal created: {signal_id} | {symbol} "
+                f"class={signal_class.value} mode={mode_str} | "
+                f"Original direction: {event.direction.value}, Trade direction: {trade_dir_str} | "
+                f"z_ER: {pending.signal_z_er:.2f} @ {bar.close:.2f} | "
+                f"Watch window: {max_wait_ms // 60000}m"
+            )
+        else:
+            logger.info(
+                f"Pending signal created: {signal_id} | {symbol} {event.direction.value} "
+                f"@ {bar.close:.2f} | z_ER: {pending.signal_z_er:.2f} | "
+                f"Peak since signal: {pending.peak_since_signal:.2f} | "
+                f"Watch window: up to {cfg.entry_trigger_max_wait_minutes}m "
+                f"(will enter AS SOON AS triggers met)"
+            )
 
         # Send Telegram notification and save to audit log
         message = self._format_pending_signal_created(pending, event)
@@ -289,6 +355,12 @@ class PositionManager:
             # Event confirmation
             'confirmation_status': event.metrics.get('confirmation_status', 'UNKNOWN'),
             'confirmations': event.metrics.get('confirmations', []),
+            # HYBRID STRATEGY metadata
+            'hybrid_strategy_enabled': hs_cfg.enabled,
+            'signal_class': pending.signal_class.value if pending.signal_class else None,
+            'trading_mode': pending.trading_mode.value if pending.trading_mode else None,
+            'original_direction': pending.original_direction.value if pending.original_direction else None,
+            'trade_direction': pending.trade_direction.value if pending.trade_direction else None,
             # Market context
             **market_ctx
         }
@@ -363,6 +435,12 @@ class PositionManager:
                             # Current state at invalidation
                             'current_price': bar.close,
                             'price_change_pct': ((bar.close - pending.signal_price) / pending.signal_price * 100) if pending.signal_price else None,
+                            # HYBRID STRATEGY metadata
+                            'signal_class': pending.signal_class.value if pending.signal_class else None,
+                            'trading_mode': pending.trading_mode.value if pending.trading_mode else None,
+                            'original_direction': pending.original_direction.value if pending.original_direction else None,
+                            'trade_direction': pending.trade_direction.value if pending.trade_direction else None,
+                            'mode_switched': pending.mode_switched,
                             # Market context
                             **market_ctx
                         }
@@ -426,6 +504,12 @@ class PositionManager:
                             'pullback_from_peak_pct': self._calculate_pullback_pct(pending, bar.close),
                             # Why triggers not met (for analysis)
                             'last_taker_share': bar.taker_buy_share(),
+                            # HYBRID STRATEGY metadata
+                            'signal_class': pending.signal_class.value if pending.signal_class else None,
+                            'trading_mode': pending.trading_mode.value if pending.trading_mode else None,
+                            'original_direction': pending.original_direction.value if pending.original_direction else None,
+                            'trade_direction': pending.trade_direction.value if pending.trade_direction else None,
+                            'mode_switched': pending.mode_switched,
                             # Market context
                             **market_ctx
                         }
@@ -452,8 +536,11 @@ class PositionManager:
                     logger.debug(f"{signal_id}: Min wait not reached ({pending.bars_since_signal}/{min_wait} bars)")
                     continue
 
-                # Evaluate triggers
-                triggers_met = await self._evaluate_pending_triggers(pending, bar, features)
+                # Evaluate triggers - route based on hybrid strategy mode
+                if self.config.hybrid_strategy.enabled and pending.signal_class is not None:
+                    triggers_met = await self._evaluate_hybrid_triggers(pending, bar, features)
+                else:
+                    triggers_met = await self._evaluate_pending_triggers(pending, bar, features)
 
                 if triggers_met:
                     # All triggers met - open position IMMEDIATELY (not after fixed delay!)
@@ -690,18 +777,49 @@ class PositionManager:
             logger.info(f"{symbol}: Position opened elsewhere, skipping pending signal")
             return
 
+        # =====================================================================
+        # HYBRID STRATEGY: Use trade_direction and mode-specific parameters
+        # =====================================================================
+        hs_cfg = self.config.hybrid_strategy
+        cfg = self.config.position_management
+
+        # Determine trade direction (may differ from signal direction for mean-reversion)
+        if hs_cfg.enabled and pending.trade_direction is not None:
+            trade_direction = pending.trade_direction
+            trading_mode = pending.trading_mode
+
+            # Get mode-specific exit parameters
+            if trading_mode == TradingMode.MEAN_REVERSION:
+                mode_cfg = hs_cfg.mean_reversion
+                atr_stop_mult = mode_cfg.atr_stop_multiplier
+                atr_target_mult = mode_cfg.atr_target_multiplier
+            elif trading_mode == TradingMode.CONDITIONAL_MOMENTUM:
+                mode_cfg = hs_cfg.conditional_momentum
+                atr_stop_mult = mode_cfg.atr_stop_multiplier
+                atr_target_mult = mode_cfg.atr_target_multiplier
+            else:  # EARLY_MOMENTUM
+                mode_cfg = hs_cfg.early_momentum
+                atr_stop_mult = mode_cfg.atr_stop_multiplier
+                atr_target_mult = mode_cfg.atr_target_multiplier
+        else:
+            # Legacy mode
+            trade_direction = event.direction
+            trading_mode = None
+            atr_stop_mult = cfg.atr_stop_multiplier
+            atr_target_mult = cfg.atr_target_multiplier
+
         # Calculate dynamic targets based on ATR
         targets = self.extended_features.calculate_dynamic_targets(
             symbol=symbol,
             entry_price=bar.close,
-            direction=event.direction,
-            atr_stop_mult=self.config.position_management.atr_stop_multiplier,
-            atr_target_mult=self.config.position_management.atr_target_multiplier,
-            min_risk_reward=self.config.position_management.min_risk_reward_ratio
+            direction=trade_direction,
+            atr_stop_mult=atr_stop_mult,
+            atr_target_mult=atr_target_mult,
+            min_risk_reward=cfg.min_risk_reward_ratio
         )
 
-        # Create position
-        position_id = f"{symbol}_{bar.ts_minute}_{event.direction.value}_triggered"
+        # Create position with trade direction
+        position_id = f"{symbol}_{bar.ts_minute}_{trade_direction.value}_triggered"
         metrics = event.metrics.copy()
 
         # Store signal → entry timing
@@ -709,6 +827,14 @@ class PositionManager:
         metrics['entry_ts'] = bar.ts_minute
         metrics['trigger_delay_bars'] = pending.bars_since_signal  # PRIMARY (exact)
         metrics['trigger_delay_seconds_approx'] = (bar.ts_minute - pending.created_ts) // 1000  # Secondary (approximate)
+
+        # Store hybrid strategy metadata
+        if hs_cfg.enabled and pending.signal_class is not None:
+            metrics['signal_class'] = pending.signal_class.value
+            metrics['trading_mode'] = trading_mode.value if trading_mode else None
+            metrics['original_direction'] = pending.original_direction.value if pending.original_direction else None
+            metrics['trade_direction'] = trade_direction.value
+            metrics['mode_switched'] = pending.mode_switched
 
         # Store dynamic targets
         if targets:
@@ -725,7 +851,7 @@ class PositionManager:
             position_id=position_id,
             event_id=event.event_id,
             symbol=symbol,
-            direction=event.direction,
+            direction=trade_direction,  # Use trade_direction for hybrid mode
             status=PositionStatus.OPEN,
             open_price=bar.close,
             open_ts=bar.ts_minute,
@@ -740,31 +866,39 @@ class PositionManager:
         await self.storage.write_position(position)
         self.open_positions[position_id] = position
 
-        logger.info(
-            f"Position opened (from pending): {position_id} | "
-            f"{symbol} {event.direction.value} @ {bar.close:.2f} | "
-            f"Trigger delay: {metrics['trigger_delay_bars']} bars (~{metrics['trigger_delay_seconds_approx']}s)"
-        )
+        # Log message based on mode
+        if hs_cfg.enabled and trading_mode:
+            logger.info(
+                f"HYBRID position opened: {position_id} | "
+                f"{symbol} {trade_direction.value} ({trading_mode.value}) @ {bar.close:.2f} | "
+                f"Signal class: {pending.signal_class.value if pending.signal_class else 'N/A'} | "
+                f"Trigger delay: {metrics['trigger_delay_bars']} bars"
+            )
+        else:
+            logger.info(
+                f"Position opened (from pending): {position_id} | "
+                f"{symbol} {trade_direction.value} @ {bar.close:.2f} | "
+                f"Trigger delay: {metrics['trigger_delay_bars']} bars (~{metrics['trigger_delay_seconds_approx']}s)"
+            )
 
         # Send Telegram notification and save to audit log
         message = self._format_position_opened_from_pending(position)
 
-        # Calculate stop/target prices for audit
-        cfg = self.config.position_management
+        # Calculate stop/target prices for audit (use mode-specific params if hybrid)
         atr = self.extended_features.get_atr(symbol)
         stop_price = None
         target_price = None
 
         if cfg.use_atr_stops and atr:
-            if event.direction == Direction.UP:
-                stop_price = bar.close - (atr * cfg.atr_stop_multiplier)
-                target_price = bar.close + (atr * cfg.atr_target_multiplier)
+            if trade_direction == Direction.UP:
+                stop_price = bar.close - (atr * atr_stop_mult)
+                target_price = bar.close + (atr * atr_target_mult)
             else:
-                stop_price = bar.close + (atr * cfg.atr_stop_multiplier)
-                target_price = bar.close - (atr * cfg.atr_target_multiplier)
+                stop_price = bar.close + (atr * atr_stop_mult)
+                target_price = bar.close - (atr * atr_target_mult)
         else:
             # Fixed percentage stops
-            if event.direction == Direction.UP:
+            if trade_direction == Direction.UP:
                 stop_price = bar.close * (1 - cfg.stop_loss_percent / 100)
                 target_price = bar.close * (1 + cfg.take_profit_percent / 100)
             else:
@@ -807,6 +941,14 @@ class PositionManager:
             # Confirmation
             'confirmation_status': event.metrics.get('confirmation_status', 'UNKNOWN'),
             'confirmations': event.metrics.get('confirmations', []),
+            # HYBRID STRATEGY metadata
+            'signal_class': pending.signal_class.value if pending.signal_class else None,
+            'trading_mode': pending.trading_mode.value if pending.trading_mode else None,
+            'original_direction': pending.original_direction.value if pending.original_direction else None,
+            'trade_direction': pending.trade_direction.value if pending.trade_direction else None,
+            'mode_switched': pending.mode_switched,
+            'z_history_length': len(pending.z_history),
+            'price_history_length': len(pending.price_history),
             # Market context
             **market_ctx
         }
@@ -1355,6 +1497,249 @@ class PositionManager:
             f"{symbol}: Beta quality filter PASSED (beta: {beta:.3f})"
         )
         return True  # Allow trading
+
+    # =========================================================================
+    # CLASS-AWARE FILTERING (Hybrid Strategy)
+    # Replaces WIN_RATE_MAX filters when hybrid_strategy.class_aware_filters.enabled
+    # Different signal classes have different filter strictness
+    # =========================================================================
+
+    def _apply_class_aware_filters(
+        self,
+        symbol: str,
+        signal_class: SignalClass,
+        bar: Bar
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Apply class-aware filters based on signal strength.
+
+        Different signal classes have different filter strictness:
+        - EXTREME_SPIKE: Relaxed filters (signal is reliable itself)
+        - STRONG_SIGNAL: Standard filters
+        - EARLY_SIGNAL: Strict filters (weak signals need extra validation)
+
+        This replaces WIN_RATE_MAX filters when class_aware_filters.enabled.
+
+        Args:
+            symbol: The symbol being evaluated for entry
+            signal_class: The signal classification (EXTREME_SPIKE, STRONG_SIGNAL, EARLY_SIGNAL)
+            bar: Current bar data for volume/trades check
+
+        Returns:
+            (True, None) if filters passed
+            (False, reason) if blocked, reason contains the block reason
+        """
+        caf_cfg = self.config.hybrid_strategy.class_aware_filters
+
+        if not caf_cfg.enabled:
+            return (True, None)  # Class-aware filters disabled
+
+        # Get filter config for this signal class
+        if signal_class == SignalClass.EXTREME_SPIKE:
+            filter_cfg = caf_cfg.extreme_spike
+        elif signal_class == SignalClass.STRONG_SIGNAL:
+            filter_cfg = caf_cfg.strong_signal
+        elif signal_class == SignalClass.EARLY_SIGNAL:
+            filter_cfg = caf_cfg.early_signal
+        else:
+            # Unknown class - use STRONG_SIGNAL defaults
+            filter_cfg = caf_cfg.strong_signal
+
+        # 1. Check global blacklist
+        if filter_cfg.use_global_blacklist:
+            profile = self.config.position_management.win_rate_max_profile
+            if symbol in profile.symbol_blacklist:
+                logger.info(
+                    f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                    f"reason=global_blacklist"
+                )
+                return (False, "global_blacklist")
+
+        # 2. Check class-specific additional blacklist
+        if symbol in filter_cfg.additional_blacklist:
+            logger.info(
+                f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                f"reason=class_blacklist"
+            )
+            return (False, "class_blacklist")
+
+        # 3. Check liquidity - volume
+        volume_usd = self._get_recent_volume_usd(symbol, bar)
+        if volume_usd < filter_cfg.min_volume_usd:
+            logger.info(
+                f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                f"reason=low_volume, metrics={{volume=${volume_usd:,.0f}, "
+                f"required=${filter_cfg.min_volume_usd:,.0f}}}"
+            )
+            return (False, "low_volume")
+
+        # 4. Check liquidity - trades count
+        trades_count = self._get_recent_trades_count(symbol, bar)
+        if trades_count < filter_cfg.min_trades_per_bar:
+            logger.info(
+                f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                f"reason=low_trades, metrics={{trades={trades_count}, "
+                f"required={filter_cfg.min_trades_per_bar}}}"
+            )
+            return (False, "low_trades")
+
+        # 5. Check BTC anomaly filter (if enabled for this class)
+        if filter_cfg.apply_btc_anomaly_filter:
+            if not self._check_btc_anomaly_filter_internal():
+                logger.info(
+                    f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                    f"reason=btc_anomaly"
+                )
+                return (False, "btc_anomaly")
+
+        # 6. Check beta quality filter (if enabled for this class)
+        if filter_cfg.apply_beta_quality_filter:
+            beta_result = self._check_beta_quality_filter_internal(
+                symbol, filter_cfg.beta_min_abs, filter_cfg.beta_max_abs
+            )
+            if beta_result is not None:
+                logger.info(
+                    f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                    f"reason={beta_result}"
+                )
+                return (False, beta_result)
+
+        # 7. Additional check for EARLY_SIGNAL: require volume spike
+        if signal_class == SignalClass.EARLY_SIGNAL and filter_cfg.require_recent_volume_spike:
+            avg_volume = self._get_average_volume(symbol, lookback=60)
+            if avg_volume > 0:
+                volume_ratio = volume_usd / avg_volume
+                if volume_ratio < filter_cfg.recent_volume_spike_threshold:
+                    logger.info(
+                        f"[FILTER] {symbol}: blocked for {signal_class.value}, "
+                        f"reason=no_volume_spike, metrics={{current_vol=${volume_usd:,.0f}, "
+                        f"avg_vol=${avg_volume:,.0f}, ratio={volume_ratio:.2f}x, "
+                        f"required={filter_cfg.recent_volume_spike_threshold:.1f}x}}"
+                    )
+                    return (False, "no_volume_spike")
+
+        # All filters passed
+        filters_applied = []
+        if filter_cfg.use_global_blacklist:
+            filters_applied.append("blacklist")
+        filters_applied.append("liquidity")
+        if filter_cfg.apply_btc_anomaly_filter:
+            filters_applied.append("btc_anomaly")
+        if filter_cfg.apply_beta_quality_filter:
+            filters_applied.append("beta_quality")
+        if signal_class == SignalClass.EARLY_SIGNAL and filter_cfg.require_recent_volume_spike:
+            filters_applied.append("volume_spike")
+
+        logger.debug(
+            f"[FILTER] {symbol}: passed for {signal_class.value}, "
+            f"filters_applied={{{', '.join(filters_applied)}}}"
+        )
+        return (True, None)
+
+    def _get_recent_volume_usd(self, symbol: str, bar: Bar) -> float:
+        """
+        Get recent volume in USD for a symbol.
+
+        For USDT pairs, notional volume IS USD volume.
+
+        Args:
+            symbol: The symbol
+            bar: Current bar data
+
+        Returns:
+            Volume in USD (notional value from bar)
+        """
+        # notional = price * quantity = USD value for USDT pairs
+        return bar.notional if bar.notional else 0.0
+
+    def _get_recent_trades_count(self, symbol: str, bar: Bar) -> int:
+        """
+        Get recent trades count for a symbol.
+
+        Args:
+            symbol: The symbol
+            bar: Current bar data
+
+        Returns:
+            Number of trades in the bar
+        """
+        return bar.trades if bar.trades else 0
+
+    def _get_average_volume(self, symbol: str, lookback: int = 60) -> float:
+        """
+        Get average volume over lookback period.
+
+        Args:
+            symbol: The symbol
+            lookback: Number of bars to average (default 60 = 1 hour)
+
+        Returns:
+            Average volume in USD, or 0 if not enough data
+        """
+        bars = list(self.extended_features.bars_windows.get(symbol, []))
+
+        if not bars or len(bars) < 2:
+            return 0.0
+
+        # Use available bars up to lookback limit
+        bars_to_use = bars[-min(len(bars), lookback):]
+
+        if not bars_to_use:
+            return 0.0
+
+        total_volume = sum(b.notional for b in bars_to_use if b.notional)
+        return total_volume / len(bars_to_use)
+
+    def _check_btc_anomaly_filter_internal(self) -> bool:
+        """
+        Internal BTC anomaly check without profile dependency.
+
+        Returns:
+            True if trading allowed (no BTC anomaly), False if blocked
+        """
+        btc_symbol = self.config.universe.benchmark_symbol
+        btc_features = self.latest_features.get(btc_symbol)
+
+        if btc_features is None:
+            return False  # Fail-closed: no BTC data = block trade
+
+        btc_z_er = abs(btc_features.z_er_15m) if btc_features.z_er_15m else 0
+        btc_z_vol = btc_features.z_vol_15m if btc_features.z_vol_15m else 0
+
+        # BTC anomaly = abs(z_ER) >= 3.0 AND z_VOL >= 3.0
+        return not (btc_z_er >= 3.0 and btc_z_vol >= 3.0)
+
+    def _check_beta_quality_filter_internal(
+        self,
+        symbol: str,
+        beta_min_abs: float,
+        beta_max_abs: float
+    ) -> Optional[str]:
+        """
+        Internal beta quality check with custom thresholds.
+
+        Args:
+            symbol: The symbol
+            beta_min_abs: Minimum absolute beta value
+            beta_max_abs: Maximum absolute beta value
+
+        Returns:
+            None if beta quality OK, reason string if blocked
+        """
+        features = self.latest_features.get(symbol)
+
+        if features is None:
+            return "beta_no_data"
+
+        beta = features.beta if features.beta else 0
+
+        if abs(beta) < beta_min_abs:
+            return "beta_too_low"
+
+        if abs(beta) > beta_max_abs:
+            return "beta_too_high"
+
+        return None  # Beta quality OK
 
     # =========================================================================
     # WIN_RATE_MAX Profile: Entry Validation (Step 4.2)
@@ -2096,9 +2481,39 @@ class PositionManager:
         if pnl_pct >= take_profit_pct:
             return ExitReason.TAKE_PROFIT
 
-        # 5. Z-Score Reversal check (RELAXED from 1.0 to 0.5)
-        if abs(features.z_er_15m) < cfg.z_score_exit_threshold:
-            return ExitReason.Z_SCORE_REVERSAL
+        # 5. Z-Score Reversal check (direction-aware for Mean-Reversion)
+        # For Mean-Reversion: direction-specific exit (not abs)
+        # For Momentum: standard abs() exit
+        trading_mode = position.metrics.get('trading_mode')
+        original_direction = position.metrics.get('original_direction')
+
+        if trading_mode == 'MEAN_REVERSION':
+            # Mean-Reversion: use mode-specific threshold and direction-aware check
+            hs_cfg = self.config.hybrid_strategy.mean_reversion
+            z_threshold = hs_cfg.z_score_exit_threshold
+
+            if hs_cfg.use_z_exit:
+                # For SHORT (fading up-spike): exit when z fell to threshold (z <= threshold)
+                # For LONG (fading down-spike): exit when z rose to threshold (z >= -threshold)
+                if position.direction == Direction.DOWN:  # Shorting to fade up-spike
+                    if features.z_er_15m <= z_threshold:
+                        return ExitReason.Z_SCORE_REVERSAL
+                else:  # Long to fade down-spike
+                    if features.z_er_15m >= -z_threshold:
+                        return ExitReason.Z_SCORE_REVERSAL
+        elif trading_mode == 'CONDITIONAL_MOMENTUM':
+            hs_cfg = self.config.hybrid_strategy.conditional_momentum
+            if hs_cfg.use_z_exit and abs(features.z_er_15m) < hs_cfg.z_score_exit_threshold:
+                return ExitReason.Z_SCORE_REVERSAL
+        elif trading_mode == 'EARLY_MOMENTUM':
+            # Early Momentum: use_z_exit = False by default, skip z-score exit
+            hs_cfg = self.config.hybrid_strategy.early_momentum
+            if hs_cfg.use_z_exit and abs(features.z_er_15m) < cfg.z_score_exit_threshold:
+                return ExitReason.Z_SCORE_REVERSAL
+        else:
+            # Legacy mode: use standard abs() check
+            if abs(features.z_er_15m) < cfg.z_score_exit_threshold:
+                return ExitReason.Z_SCORE_REVERSAL
 
         # 6. Opposite Signal check (strong signal in opposite direction)
         if cfg.exit_on_opposite_signal:
@@ -2301,6 +2716,11 @@ class PositionManager:
             # Original entry settings (for comparison)
             'original_stop_loss_price': position.metrics.get('stop_loss_price'),
             'original_take_profit_price': position.metrics.get('take_profit_price'),
+            # HYBRID STRATEGY metadata
+            'signal_class': position.metrics.get('signal_class'),
+            'trading_mode': position.metrics.get('trading_mode'),
+            'original_direction': position.metrics.get('original_direction'),
+            'mode_switched': position.metrics.get('mode_switched', False),
             # Market context at exit
             **market_ctx
         }
@@ -2519,10 +2939,49 @@ class PositionManager:
         trigger_delay_bars = position.metrics.get('trigger_delay_bars', 0)
         trigger_delay_seconds = position.metrics.get('trigger_delay_seconds_approx', 0)
 
+        # =====================================================================
+        # HYBRID STRATEGY: Show signal class and trading mode
+        # =====================================================================
+        hs_cfg = self.config.hybrid_strategy
+        hybrid_section = ""
+
+        signal_class_val = position.metrics.get('signal_class')
+        trading_mode_val = position.metrics.get('trading_mode')
+        original_direction_val = position.metrics.get('original_direction')
+
+        if hs_cfg.enabled and signal_class_val:
+            # Signal class descriptions
+            signal_class_names = {
+                "EXTREME_SPIKE": "🔥 EXTREME SPIKE",
+                "STRONG_SIGNAL": "💪 STRONG SIGNAL",
+                "EARLY_SIGNAL": "🌱 EARLY SIGNAL"
+            }
+            signal_class_display = signal_class_names.get(signal_class_val, signal_class_val)
+
+            # Trading mode descriptions
+            trading_mode_names = {
+                "MEAN_REVERSION": "📉 MEAN-REVERSION",
+                "CONDITIONAL_MOMENTUM": "📈 CONDITIONAL MOMENTUM",
+                "EARLY_MOMENTUM": "🚀 EARLY MOMENTUM"
+            }
+            trading_mode_display = trading_mode_names.get(trading_mode_val, trading_mode_val or "N/A")
+
+            # Show direction change for mean-reversion
+            direction_note = ""
+            if original_direction_val and original_direction_val != position.direction.value:
+                orig_emoji = "🟢" if original_direction_val == "UP" else "🔴"
+                direction_note = f"\n   • ⚠️ Signal was {orig_emoji} {original_direction_val}, trading opposite (fade)"
+
+            hybrid_section = f"""
+🧬 <b>HYBRID STRATEGY:</b>
+   • Класс: {signal_class_display}
+   • Режим: {trading_mode_display}{direction_note}
+"""
+
         message = f"""📊 <b>POSITION OPENED</b> (from pending signal)
 
 {direction_emoji} <b>{position.symbol} {position.direction.value}</b>
-
+{hybrid_section}
 ⏱️ <b>Entry Timing:</b>
    • Signal → Entry: {trigger_delay_bars} bars (~{trigger_delay_seconds}s)
 
@@ -2591,9 +3050,33 @@ class PositionManager:
         }
         exit_reason_display = exit_reason_names.get(position.exit_reason, position.exit_reason.value if position.exit_reason else 'N/A')
 
+        # =====================================================================
+        # HYBRID STRATEGY: Show signal class and trading mode in close message
+        # =====================================================================
+        hs_cfg = self.config.hybrid_strategy
+        hybrid_section = ""
+
+        signal_class_val = position.metrics.get('signal_class')
+        trading_mode_val = position.metrics.get('trading_mode')
+
+        if hs_cfg.enabled and signal_class_val:
+            signal_class_names = {
+                "EXTREME_SPIKE": "🔥 EXTREME",
+                "STRONG_SIGNAL": "💪 STRONG",
+                "EARLY_SIGNAL": "🌱 EARLY"
+            }
+            trading_mode_names = {
+                "MEAN_REVERSION": "📉 MR",
+                "CONDITIONAL_MOMENTUM": "📈 CM",
+                "EARLY_MOMENTUM": "🚀 EM"
+            }
+            signal_class_display = signal_class_names.get(signal_class_val, signal_class_val)
+            trading_mode_display = trading_mode_names.get(trading_mode_val, trading_mode_val or "N/A")
+            hybrid_section = f"\n🧬 Strategy: {signal_class_display} | {trading_mode_display}"
+
         message = f"""💼 <b>POSITION CLOSED</b> {pnl_emoji}
 
-{direction_emoji} <b>{position.symbol} {position.direction.value}</b>
+{direction_emoji} <b>{position.symbol} {position.direction.value}</b>{hybrid_section}
 
 💰 <b>PnL: {position.pnl_percent:+.2f}%</b>
 💵 Price: {format_price(position.open_price)} → {format_price(position.close_price)}
@@ -2635,6 +3118,7 @@ class PositionManager:
 
         # Generate detailed reason for signal creation
         cfg = self.config.position_management
+        hs_cfg = self.config.hybrid_strategy
         taker_threshold_high = 0.65
         taker_threshold_low = 0.35
 
@@ -2654,13 +3138,93 @@ class PositionManager:
             f"   • {flow_description} ✓"
         )
 
-        # Entry requirements
-        entry_requirements = (
-            f"Для входа в позицию требуется:\n"
-            f"   • Z-score остынет до [{cfg.entry_trigger_z_cooldown:.1f}, 3.0]σ\n"
-            f"   • Откат от пика ≥ {cfg.entry_trigger_pullback_pct:.1f}%\n"
-            f"   • Flow-доминирование ≥ {cfg.entry_trigger_min_taker_dominance:.0%}"
-        )
+        # =====================================================================
+        # HYBRID STRATEGY: Add signal classification and trading mode info
+        # =====================================================================
+        hybrid_section = ""
+        if hs_cfg.enabled and pending.signal_class is not None:
+            # Signal class descriptions
+            signal_class_names = {
+                SignalClass.EXTREME_SPIKE: "🔥 EXTREME SPIKE (z ≥ 5.0σ)",
+                SignalClass.STRONG_SIGNAL: "💪 STRONG SIGNAL (3.0-5.0σ)",
+                SignalClass.EARLY_SIGNAL: "🌱 EARLY SIGNAL (1.5-3.0σ)"
+            }
+            signal_class_display = signal_class_names.get(pending.signal_class, pending.signal_class.value)
+
+            # Trading mode descriptions
+            trading_mode_names = {
+                TradingMode.MEAN_REVERSION: "📉 MEAN-REVERSION (fade the move)",
+                TradingMode.CONDITIONAL_MOMENTUM: "📈 CONDITIONAL MOMENTUM (follow if confirmed)",
+                TradingMode.EARLY_MOMENTUM: "🚀 EARLY MOMENTUM (wait for continuation)"
+            }
+            trading_mode_display = trading_mode_names.get(pending.trading_mode, pending.trading_mode.value if pending.trading_mode else "N/A")
+
+            # Trade direction vs original direction
+            trade_dir_emoji = "🟢" if pending.trade_direction == Direction.UP else "🔴"
+            trade_dir_ru = "ЛОНГ" if pending.trade_direction == Direction.UP else "ШОРТ"
+
+            # Build hybrid section
+            hybrid_section = f"""
+🧬 <b>HYBRID STRATEGY:</b>
+   • Класс: {signal_class_display}
+   • Режим: {trading_mode_display}
+   • Направление сигнала: {pending.direction.value} ({direction_ru})
+   • Направление сделки: {trade_dir_emoji} {pending.trade_direction.value} ({trade_dir_ru})
+"""
+            # Add mode-specific entry requirements
+            if pending.signal_class == SignalClass.EXTREME_SPIKE:
+                mr_cfg = hs_cfg.mean_reversion
+                hybrid_section += f"""
+🎯 <b>Entry Requirements (Mean-Reversion):</b>
+   • Z-score drop ≥ {mr_cfg.reversal_z_drop_pct:.0%} от сигнала
+   • Price confirmation: движение в направлении сделки
+   • Volume fade: снижение объёма
+   • Min bars: {mr_cfg.min_bars_before_entry} | Max bars: {mr_cfg.max_bars_before_expiry}
+"""
+            elif pending.signal_class == SignalClass.STRONG_SIGNAL:
+                cm_cfg = hs_cfg.conditional_momentum
+                hybrid_section += f"""
+🎯 <b>Entry Requirements (Conditional Momentum):</b>
+   • No divergence: цена и z-score вместе
+   • Volume retention ≥ {cm_cfg.min_volume_retention:.0%}
+   • Taker dominance ≥ {cm_cfg.min_taker_dominance:.0%}
+   • Z-score stability: variance < {cm_cfg.max_z_variance_pct:.0%}
+   • Mode switch: если momentum fails → mean-reversion
+"""
+            else:  # EARLY_SIGNAL
+                em_cfg = hs_cfg.early_momentum
+                hybrid_section += f"""
+🎯 <b>Entry Requirements (Early Momentum):</b>
+   • Z-score growth ≥ {em_cfg.min_z_growth_pct:.0%}
+   • Price follow-through ≥ {em_cfg.min_price_follow_through_pct:.1%}
+   • Volume sustained
+   • Taker persistence ≥ {em_cfg.min_taker_persistence:.0%}
+   • Min wait: {em_cfg.min_wait_bars} bars | Max: {em_cfg.max_wait_bars} bars
+"""
+        else:
+            # Legacy mode entry requirements
+            entry_requirements = (
+                f"Для входа в позицию требуется:\n"
+                f"   • Z-score остынет до [{cfg.entry_trigger_z_cooldown:.1f}, 3.0]σ\n"
+                f"   • Откат от пика ≥ {cfg.entry_trigger_pullback_pct:.1f}%\n"
+                f"   • Flow-доминирование ≥ {cfg.entry_trigger_min_taker_dominance:.0%}"
+            )
+            hybrid_section = f"""
+🎯 <b>Условия входа:</b>
+{entry_requirements}
+"""
+
+        # Determine max wait based on mode
+        if hs_cfg.enabled and pending.signal_class is not None:
+            if pending.signal_class == SignalClass.EXTREME_SPIKE:
+                max_wait_bars = hs_cfg.mean_reversion.max_bars_before_expiry
+            elif pending.signal_class == SignalClass.STRONG_SIGNAL:
+                max_wait_bars = hs_cfg.conditional_momentum.max_wait_bars
+            else:
+                max_wait_bars = hs_cfg.early_momentum.max_wait_bars
+            watch_window_info = f"   • Макс. ожидание: {max_wait_bars} bars (~{max_wait_bars}m)"
+        else:
+            watch_window_info = f"   • Макс. ожидание: {cfg.entry_trigger_max_wait_minutes}m"
 
         message = f"""⏳ <b>PENDING SIGNAL CREATED</b>
 
@@ -2676,12 +3240,9 @@ class PositionManager:
 
 📝 <b>Почему создан сигнал:</b>
 {detection_details}
-
-🎯 <b>Условия входа:</b>
-{entry_requirements}
-
+{hybrid_section}
 ⏱️ <b>Watch Window:</b>
-   • Макс. ожидание: {cfg.entry_trigger_max_wait_minutes}m
+{watch_window_info}
    • Вход: как только все триггеры сработают
 
 🕐 Время: {timestamp}
@@ -2795,6 +3356,486 @@ class PositionManager:
 """
 
         return message
+
+    # =========================================================================
+    # HYBRID STRATEGY METHODS
+    # =========================================================================
+
+    def _get_trading_mode_and_direction(
+        self,
+        signal_class: SignalClass,
+        original_direction: Direction
+    ) -> tuple:
+        """
+        Determine trading mode and trade direction based on signal class.
+
+        For EXTREME_SPIKE (mean-reversion): trade AGAINST the move (fade)
+        For STRONG_SIGNAL / EARLY_SIGNAL (momentum): trade WITH the move
+
+        Returns:
+            (TradingMode, Direction) tuple
+        """
+        if signal_class == SignalClass.EXTREME_SPIKE:
+            # Mean-reversion: fade the extreme move
+            trade_direction = Direction.DOWN if original_direction == Direction.UP else Direction.UP
+            return (TradingMode.MEAN_REVERSION, trade_direction)
+
+        elif signal_class == SignalClass.STRONG_SIGNAL:
+            # Conditional momentum: follow if confirmed
+            return (TradingMode.CONDITIONAL_MOMENTUM, original_direction)
+
+        else:  # EARLY_SIGNAL
+            # Early momentum: follow if continuation confirmed
+            return (TradingMode.EARLY_MOMENTUM, original_direction)
+
+    async def _evaluate_hybrid_triggers(
+        self,
+        pending: PendingSignal,
+        current_bar: Bar,
+        current_features: Optional['Features']
+    ) -> bool:
+        """
+        Evaluate hybrid strategy entry triggers based on signal class.
+
+        Routes to mode-specific evaluator:
+        - EXTREME_SPIKE -> _evaluate_mean_reversion_triggers
+        - STRONG_SIGNAL -> _evaluate_strong_signal_triggers (with mode switch)
+        - EARLY_SIGNAL -> _evaluate_early_signal_triggers
+
+        Returns True if position should be opened.
+        """
+        # Update history tracking
+        if current_features is not None:
+            pending.update_history(current_features, current_bar)
+
+        signal_class = pending.signal_class
+
+        if signal_class == SignalClass.EXTREME_SPIKE:
+            return await self._evaluate_mean_reversion_triggers(
+                pending, current_bar, current_features
+            )
+
+        elif signal_class == SignalClass.STRONG_SIGNAL:
+            result = await self._evaluate_strong_signal_triggers(
+                pending, current_bar, current_features
+            )
+
+            # Check for mode switch
+            if not result and not pending.invalidated and pending.mode_switched:
+                # Switched to mean-reversion, re-evaluate with MR triggers
+                logger.info(
+                    f"{pending.symbol}: Strong signal switched to MEAN_REVERSION mode, "
+                    f"re-evaluating with MR triggers"
+                )
+                return await self._evaluate_mean_reversion_triggers(
+                    pending, current_bar, current_features
+                )
+
+            return result
+
+        else:  # EARLY_SIGNAL
+            return await self._evaluate_early_signal_triggers(
+                pending, current_bar, current_features
+            )
+
+    async def _evaluate_mean_reversion_triggers(
+        self,
+        pending: PendingSignal,
+        current_bar: Bar,
+        current_features: Optional['Features']
+    ) -> bool:
+        """
+        Evaluate entry triggers for MEAN_REVERSION mode (EXTREME_SPIKE signals).
+
+        Entry conditions (ALL must be met):
+        1. Reversal started: Z-score dropped >= 20% from signal
+        2. Price confirmation: Price moving in trade_direction
+        3. Volume fade: Current volume z-score < signal volume z-score
+        4. Time filter: bars >= min_bars AND bars <= max_bars
+
+        Returns True if all triggers met.
+        """
+        symbol = pending.symbol
+        hs_cfg = self.config.hybrid_strategy.mean_reversion
+
+        # Need features
+        if current_features is None:
+            logger.debug(f"{symbol}: MR - No features available, waiting...")
+            return False
+
+        # Time filter: minimum bars before entry
+        if pending.bars_since_signal < hs_cfg.min_bars_before_entry:
+            logger.debug(
+                f"{symbol}: MR - Too early, bars={pending.bars_since_signal} < {hs_cfg.min_bars_before_entry}"
+            )
+            return False
+
+        # Invalidation: Z-score grew (move continuing, not reversing)
+        if hs_cfg.invalidate_on_z_growth:
+            current_z_abs = abs(current_features.z_er_15m)
+            signal_z_abs = abs(pending.signal_z_er)
+            growth_ratio = current_z_abs / signal_z_abs if signal_z_abs > 0 else 1.0
+
+            if growth_ratio >= hs_cfg.z_growth_invalidate_threshold:
+                pending.invalidated = True
+                pending.invalidation_reason = "z_growth"
+                pending.invalidation_details = (
+                    f"Z-score grew from {signal_z_abs:.2f} to {current_z_abs:.2f} "
+                    f"(ratio {growth_ratio:.2f} >= {hs_cfg.z_growth_invalidate_threshold}). "
+                    f"Move continuing, not reversing."
+                )
+                logger.info(f"{symbol}: MR invalidated - {pending.invalidation_details}")
+                return False
+
+        # Invalidation: Volume still growing (momentum not fading)
+        if hs_cfg.require_volume_fade and len(pending.vol_history) >= 2:
+            if pending.vol_history[-1] > pending.vol_history[-2]:
+                pending.volume_growth_streak += 1
+            else:
+                pending.volume_growth_streak = 0
+
+            if pending.volume_growth_streak >= hs_cfg.max_volume_growth_bars:
+                pending.invalidated = True
+                pending.invalidation_reason = "volume_growth"
+                pending.invalidation_details = (
+                    f"Volume grew for {pending.volume_growth_streak} consecutive bars. "
+                    f"Momentum not fading."
+                )
+                logger.info(f"{symbol}: MR invalidated - {pending.invalidation_details}")
+                return False
+
+        # Trigger 1: Reversal started (Z-score dropped sufficiently)
+        z_drop = pending.get_z_drop_pct()
+        if z_drop is None or z_drop < hs_cfg.reversal_z_drop_pct:
+            logger.debug(
+                f"{symbol}: MR - Z-score not dropped enough "
+                f"(drop={z_drop:.1%} if z_drop else 'N/A', need {hs_cfg.reversal_z_drop_pct:.0%})"
+            )
+            pending.reversal_started = False
+        else:
+            pending.reversal_started = True
+            logger.debug(f"{symbol}: MR - Reversal detected (z dropped {z_drop:.1%}) ✓")
+
+        # Trigger 2: Price confirmation
+        price_confirmed = False
+        if hs_cfg.require_price_confirmation:
+            trade_dir = pending.trade_direction
+            if trade_dir == Direction.UP:
+                # For long (fading a down move): price should be rising
+                price_confirmed = current_bar.close > pending.signal_price
+            else:  # DOWN
+                # For short (fading an up move): price should be falling
+                price_confirmed = current_bar.close < pending.signal_price
+
+            if price_confirmed:
+                logger.debug(f"{symbol}: MR - Price confirming reversal ✓")
+            else:
+                logger.debug(f"{symbol}: MR - Price not confirming yet")
+        else:
+            price_confirmed = True
+
+        # Trigger 3: Volume fade
+        volume_fading = False
+        if hs_cfg.require_volume_fade and len(pending.vol_history) >= 1:
+            current_vol_z = current_features.z_vol_15m
+            signal_vol_z = pending.signal_z_vol
+            volume_fading = current_vol_z < signal_vol_z
+            if volume_fading:
+                logger.debug(f"{symbol}: MR - Volume fading ({current_vol_z:.2f} < {signal_vol_z:.2f}) ✓")
+            else:
+                logger.debug(f"{symbol}: MR - Volume still elevated")
+        else:
+            volume_fading = True  # If disabled or no data
+
+        # Check if all triggers met
+        all_met = (
+            pending.reversal_started and
+            price_confirmed and
+            volume_fading
+        )
+
+        if all_met:
+            logger.info(
+                f"{symbol}: MR - ALL entry triggers met! "
+                f"(reversal: {pending.reversal_started}, price: {price_confirmed}, vol_fade: {volume_fading})"
+            )
+
+        return all_met
+
+    async def _evaluate_strong_signal_triggers(
+        self,
+        pending: PendingSignal,
+        current_bar: Bar,
+        current_features: Optional['Features']
+    ) -> bool:
+        """
+        Evaluate entry triggers for CONDITIONAL_MOMENTUM mode (STRONG_SIGNAL signals).
+
+        Entry conditions (ALL must be met):
+        1. No divergence: Price and z-score moving in same direction
+        2. Volume maintained: Current vol_z >= signal_vol_z * retention_pct
+        3. Taker dominance: Strong (>= 70% for long, <= 30% for short)
+        4. Z-score stability: Variance over last N bars within threshold
+
+        Mode switch to MEAN_REVERSION if:
+        - Z dropped > 30%
+        - Taker flow reversed (crossed 50%)
+        - Price reversed past signal price
+
+        Returns True if all triggers met.
+        """
+        symbol = pending.symbol
+        hs_cfg = self.config.hybrid_strategy.conditional_momentum
+        common_cfg = self.config.hybrid_strategy.common
+
+        # Need features
+        if current_features is None:
+            logger.debug(f"{symbol}: CM - No features available, waiting...")
+            return False
+
+        # Need minimum bars for stability check
+        if pending.bars_since_signal < hs_cfg.confirmation_bars:
+            logger.debug(
+                f"{symbol}: CM - Need more bars for stability check "
+                f"({pending.bars_since_signal}/{hs_cfg.confirmation_bars})"
+            )
+            return False
+
+        direction = pending.direction
+        current_z = current_features.z_er_15m
+        signal_z = pending.signal_z_er
+
+        # Check for mode switch conditions
+        if hs_cfg.enable_mode_switch and not pending.mode_switched:
+            switch_reason = None
+
+            # Check Z-score drop
+            z_drop = pending.get_z_drop_pct()
+            if z_drop is not None and z_drop >= hs_cfg.mode_switch_z_drop_pct:
+                switch_reason = f"z_drop={z_drop:.1%}"
+
+            # Check taker reversal
+            current_taker = current_features.taker_buy_share_15m
+            if current_taker is not None:
+                if direction == Direction.UP and current_taker < hs_cfg.mode_switch_taker_reversal:
+                    switch_reason = f"taker_reversal={current_taker:.2f}"
+                elif direction == Direction.DOWN and current_taker > hs_cfg.mode_switch_taker_reversal:
+                    switch_reason = f"taker_reversal={current_taker:.2f}"
+
+            # Check price reversal
+            if hs_cfg.mode_switch_price_reversal:
+                if direction == Direction.UP and current_bar.close < pending.signal_price:
+                    switch_reason = f"price_reversal={current_bar.close:.2f} < {pending.signal_price:.2f}"
+                elif direction == Direction.DOWN and current_bar.close > pending.signal_price:
+                    switch_reason = f"price_reversal={current_bar.close:.2f} > {pending.signal_price:.2f}"
+
+            if switch_reason:
+                # Switch to mean-reversion mode
+                pending.trading_mode = TradingMode.MEAN_REVERSION
+                pending.trade_direction = Direction.DOWN if direction == Direction.UP else Direction.UP
+                pending.mode_switched = True
+                logger.info(
+                    f"{symbol}: CM -> MR mode switch triggered: {switch_reason}. "
+                    f"New trade direction: {pending.trade_direction.value}"
+                )
+                return False  # Will re-evaluate with MR triggers
+
+        # Trigger 1: No divergence (price and z moving together)
+        no_divergence = True
+        if hs_cfg.require_no_divergence:
+            price_moving_up = current_bar.close > pending.signal_price
+            z_stable_or_better = abs(current_z) >= abs(signal_z) * 0.75
+
+            if direction == Direction.UP:
+                no_divergence = price_moving_up and z_stable_or_better
+            else:
+                no_divergence = (not price_moving_up) and z_stable_or_better
+
+            if no_divergence:
+                logger.debug(f"{symbol}: CM - No divergence ✓")
+            else:
+                logger.debug(f"{symbol}: CM - Divergence detected")
+
+        # Trigger 2: Volume maintained
+        current_vol_z = current_features.z_vol_15m
+        signal_vol_z = pending.signal_z_vol
+        min_vol = signal_vol_z * hs_cfg.min_volume_retention
+        volume_maintained = current_vol_z >= min_vol
+
+        if volume_maintained:
+            logger.debug(f"{symbol}: CM - Volume maintained ({current_vol_z:.2f} >= {min_vol:.2f}) ✓")
+        else:
+            logger.debug(f"{symbol}: CM - Volume dropped ({current_vol_z:.2f} < {min_vol:.2f})")
+
+        # Trigger 3: Taker dominance (strong)
+        current_taker = current_features.taker_buy_share_15m
+        taker_dominant = False
+        if current_taker is not None:
+            if direction == Direction.UP:
+                taker_dominant = current_taker >= hs_cfg.min_taker_dominance
+            else:
+                taker_dominant = current_taker <= (1.0 - hs_cfg.min_taker_dominance)
+
+            if taker_dominant:
+                logger.debug(f"{symbol}: CM - Taker dominant ({current_taker:.2f}) ✓")
+            else:
+                logger.debug(f"{symbol}: CM - Taker not dominant ({current_taker:.2f})")
+        else:
+            logger.debug(f"{symbol}: CM - No taker data")
+
+        # Trigger 4: Z-score stability
+        z_variance = pending.get_z_variance(last_n_bars=hs_cfg.confirmation_bars)
+        z_stable = False
+        if z_variance is not None:
+            max_variance = (abs(signal_z) * hs_cfg.max_z_variance_pct) ** 2
+            z_stable = z_variance <= max_variance
+            if z_stable:
+                pending.z_stable_bar_count += 1
+                logger.debug(f"{symbol}: CM - Z-score stable (var={z_variance:.4f} <= {max_variance:.4f}) ✓")
+            else:
+                pending.z_stable_bar_count = 0
+                logger.debug(f"{symbol}: CM - Z-score unstable (var={z_variance:.4f} > {max_variance:.4f})")
+        else:
+            logger.debug(f"{symbol}: CM - Not enough history for variance check")
+
+        # Check if all triggers met
+        all_met = no_divergence and volume_maintained and taker_dominant and z_stable
+
+        if all_met:
+            logger.info(
+                f"{symbol}: CM - ALL entry triggers met! "
+                f"(no_div: {no_divergence}, vol: {volume_maintained}, "
+                f"taker: {taker_dominant}, z_stable: {z_stable})"
+            )
+
+        return all_met
+
+    async def _evaluate_early_signal_triggers(
+        self,
+        pending: PendingSignal,
+        current_bar: Bar,
+        current_features: Optional['Features']
+    ) -> bool:
+        """
+        Evaluate entry triggers for EARLY_MOMENTUM mode (EARLY_SIGNAL signals).
+
+        Must wait min_wait_bars (3) before evaluating.
+
+        Entry conditions (ALL must be met):
+        1. Z-score growth: Z grew >= 30% from signal
+        2. Price follow-through: Price moved >= 0.15% in direction
+        3. Volume sustained: Current volume >= early volume
+        4. Taker persistence: Min taker over last 3 bars >= threshold
+
+        Invalidation:
+        - Z declined > 20% (momentum died)
+        - No continuation by max_wait_bars
+
+        Returns True if all triggers met.
+        """
+        symbol = pending.symbol
+        hs_cfg = self.config.hybrid_strategy.early_momentum
+        direction = pending.direction
+
+        # Need features
+        if current_features is None:
+            logger.debug(f"{symbol}: EM - No features available, waiting...")
+            return False
+
+        # Must wait minimum bars
+        if pending.bars_since_signal < hs_cfg.min_wait_bars:
+            logger.debug(
+                f"{symbol}: EM - Waiting for min bars "
+                f"({pending.bars_since_signal}/{hs_cfg.min_wait_bars})"
+            )
+            return False
+
+        pending.early_wait_complete = True
+
+        # Check invalidation: Z declined
+        z_growth = pending.get_z_growth_pct()
+        if z_growth is not None and z_growth < -hs_cfg.z_decline_invalidate_pct:
+            pending.invalidated = True
+            pending.invalidation_reason = "z_decline"
+            pending.invalidation_details = (
+                f"Z-score declined {abs(z_growth):.1%} (threshold: {hs_cfg.z_decline_invalidate_pct:.0%}). "
+                f"Momentum died."
+            )
+            logger.info(f"{symbol}: EM invalidated - {pending.invalidation_details}")
+            return False
+
+        # Trigger 1: Z-score growth
+        z_growing = False
+        if z_growth is not None:
+            z_growing = z_growth >= hs_cfg.min_z_growth_pct
+            if z_growing:
+                logger.debug(f"{symbol}: EM - Z growing ({z_growth:.1%} >= {hs_cfg.min_z_growth_pct:.0%}) ✓")
+            else:
+                logger.debug(f"{symbol}: EM - Z not growing enough ({z_growth:.1%})")
+        else:
+            logger.debug(f"{symbol}: EM - Cannot calculate z growth")
+
+        # Trigger 2: Price follow-through
+        price_change = pending.get_price_change_pct()
+        price_following = False
+        if price_change is not None:
+            price_following = price_change >= hs_cfg.min_price_follow_through_pct
+            if price_following:
+                logger.debug(
+                    f"{symbol}: EM - Price following "
+                    f"({price_change:.2f}% >= {hs_cfg.min_price_follow_through_pct}%) ✓"
+                )
+            else:
+                logger.debug(f"{symbol}: EM - Price not following ({price_change:.2f}%)")
+        else:
+            logger.debug(f"{symbol}: EM - Cannot calculate price change")
+
+        # Trigger 3: Volume sustained
+        volume_sustained = True
+        if hs_cfg.volume_must_sustain:
+            early_vol = pending.get_avg_volume_early()
+            current_vol = pending.get_avg_volume_current()
+            if early_vol is not None and current_vol is not None:
+                volume_sustained = current_vol >= early_vol
+                if volume_sustained:
+                    logger.debug(
+                        f"{symbol}: EM - Volume sustained ({current_vol:.2f} >= {early_vol:.2f}) ✓"
+                    )
+                else:
+                    logger.debug(
+                        f"{symbol}: EM - Volume declined ({current_vol:.2f} < {early_vol:.2f})"
+                    )
+            else:
+                logger.debug(f"{symbol}: EM - Not enough volume history")
+
+        # Trigger 4: Taker persistence
+        min_taker = pending.get_min_taker_recent(last_n_bars=3)
+        taker_persistent = False
+        if min_taker is not None:
+            if direction == Direction.UP:
+                taker_persistent = min_taker >= hs_cfg.min_taker_persistence
+            else:
+                taker_persistent = min_taker <= (1.0 - hs_cfg.min_taker_persistence)
+
+            if taker_persistent:
+                logger.debug(f"{symbol}: EM - Taker persistent (min={min_taker:.2f}) ✓")
+            else:
+                logger.debug(f"{symbol}: EM - Taker not persistent (min={min_taker:.2f})")
+        else:
+            logger.debug(f"{symbol}: EM - Not enough taker history")
+
+        # Check if all triggers met
+        all_met = z_growing and price_following and volume_sustained and taker_persistent
+
+        if all_met:
+            pending.continuation_confirmed = True
+            logger.info(
+                f"{symbol}: EM - ALL entry triggers met (continuation confirmed)! "
+                f"(z_grow: {z_growing}, price: {price_following}, "
+                f"vol: {volume_sustained}, taker: {taker_persistent})"
+            )
+
+        return all_met
 
     async def close(self) -> None:
         """Cleanup on shutdown."""

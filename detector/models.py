@@ -17,6 +17,32 @@ class Direction(str, Enum):
     DOWN = "DOWN"
 
 
+class SignalClass(str, Enum):
+    """
+    Signal classification based on z-score magnitude.
+
+    EXTREME_SPIKE: z >= 5.0 - Mean-reversion (fade the move)
+    STRONG_SIGNAL: 3.0 <= z < 5.0 - Conditional momentum (need confirmation)
+    EARLY_SIGNAL: 1.5 <= z < 3.0 - Wait for continuation
+    """
+    EXTREME_SPIKE = "EXTREME_SPIKE"
+    STRONG_SIGNAL = "STRONG_SIGNAL"
+    EARLY_SIGNAL = "EARLY_SIGNAL"
+
+
+class TradingMode(str, Enum):
+    """
+    Trading mode determines entry triggers and exit parameters.
+
+    MEAN_REVERSION: Trade AGAINST the anomaly (fade extreme moves)
+    CONDITIONAL_MOMENTUM: Trade WITH the anomaly (if confirmed)
+    EARLY_MOMENTUM: Trade WITH early signals (if continuation confirmed)
+    """
+    MEAN_REVERSION = "MEAN_REVERSION"
+    CONDITIONAL_MOMENTUM = "CONDITIONAL_MOMENTUM"
+    EARLY_MOMENTUM = "EARLY_MOMENTUM"
+
+
 
 
 @dataclass
@@ -112,6 +138,13 @@ class Event:
     direction: Direction
     metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Hybrid Strategy: Signal classification
+    signal_class: Optional[SignalClass] = None  # EXTREME_SPIKE, STRONG_SIGNAL, EARLY_SIGNAL
+    original_z_score: Optional[float] = None  # Exact z_er_15m at detection
+    original_vol_z: Optional[float] = None  # Exact z_vol_15m at detection
+    original_taker_share: Optional[float] = None  # taker_share at detection
+    original_price: Optional[float] = None  # bar.close at detection
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -119,7 +152,12 @@ class Event:
             'ts': self.ts,
             'initiator_symbol': self.initiator_symbol,
             'direction': self.direction.value,
-            'metrics': self.metrics
+            'metrics': self.metrics,
+            'signal_class': self.signal_class.value if self.signal_class else None,
+            'original_z_score': self.original_z_score,
+            'original_vol_z': self.original_vol_z,
+            'original_taker_share': self.original_taker_share,
+            'original_price': self.original_price
         }
 
 
@@ -170,6 +208,34 @@ class PendingSignal:
     z_cooldown_in_range: bool = False  # Z-score in [min, max] range
     flow_death_bar_count: int = 0  # Consecutive bars with low dominance
 
+    # =========== HYBRID STRATEGY FIELDS ===========
+    # Signal classification
+    signal_class: Optional[SignalClass] = None  # EXTREME_SPIKE, STRONG_SIGNAL, EARLY_SIGNAL
+    trading_mode: Optional[TradingMode] = None  # MEAN_REVERSION, CONDITIONAL_MOMENTUM, EARLY_MOMENTUM
+    trade_direction: Optional[Direction] = None  # May differ from direction for mean-reversion!
+    original_direction: Optional[Direction] = None  # Original z-score direction (preserved)
+
+    # History tracking for hybrid strategy evaluation
+    z_history: List[float] = field(default_factory=list)  # z_er_15m per bar
+    vol_history: List[float] = field(default_factory=list)  # z_vol_15m per bar
+    taker_history: List[float] = field(default_factory=list)  # taker_share per bar
+    price_history: List[float] = field(default_factory=list)  # close price per bar
+
+    # State tracking for mode switching and confirmation
+    mode_switched: bool = False  # Strong signal switched to mean-reversion
+    continuation_confirmed: bool = False  # Early signal continuation confirmed
+    reversal_started: bool = False  # Mean-reversion: reversal detection confirmed
+
+    # Mean-Reversion specific
+    reversal_bar_count: int = 0  # Bars since reversal started
+    volume_growth_streak: int = 0  # Consecutive bars of volume growth (for invalidation)
+
+    # Strong Signal specific
+    z_stable_bar_count: int = 0  # Bars where z-score remained stable
+
+    # Early Signal specific
+    early_wait_complete: bool = False  # Passed minimum wait bars (3)
+
     def is_expired(self, current_bar_ts: int) -> bool:
         """
         Check if max watch window (TTL) exceeded.
@@ -198,6 +264,93 @@ class PendingSignal:
         # If triggers disabled, always True
         # If enabled, require all 3
         return self.z_cooldown_met and self.pullback_met and self.stability_met
+
+    # =========== HYBRID STRATEGY METHODS ===========
+
+    def update_history(self, features: 'Features', bar: 'Bar') -> None:
+        """
+        Update history tracking for hybrid strategy evaluation.
+        Called on each bar evaluation.
+        """
+        if features.z_er_15m is not None:
+            self.z_history.append(features.z_er_15m)
+        if features.z_vol_15m is not None:
+            self.vol_history.append(features.z_vol_15m)
+        if features.taker_buy_share_15m is not None:
+            self.taker_history.append(features.taker_buy_share_15m)
+        self.price_history.append(bar.close)
+
+    def get_z_variance(self, last_n_bars: int = 3) -> Optional[float]:
+        """
+        Calculate variance of z-scores over last N bars.
+        Used for STRONG_SIGNAL stability check.
+        """
+        if len(self.z_history) < last_n_bars:
+            return None
+        recent = self.z_history[-last_n_bars:]
+        mean_z = sum(recent) / len(recent)
+        variance = sum((z - mean_z) ** 2 for z in recent) / len(recent)
+        return variance
+
+    def get_z_growth_pct(self) -> Optional[float]:
+        """
+        Calculate z-score growth percentage from signal.
+        Used for EARLY_SIGNAL continuation check.
+        """
+        if not self.z_history or self.signal_z_er == 0:
+            return None
+        current_z = self.z_history[-1]
+        # For both directions, we want to see z moving further from zero
+        growth = (abs(current_z) - abs(self.signal_z_er)) / abs(self.signal_z_er)
+        return growth
+
+    def get_z_drop_pct(self) -> Optional[float]:
+        """
+        Calculate z-score drop percentage from signal.
+        Used for EXTREME_SPIKE reversal check.
+        """
+        if not self.z_history or self.signal_z_er == 0:
+            return None
+        current_z = self.z_history[-1]
+        # Measure how much z has dropped towards zero
+        drop = 1.0 - (abs(current_z) / abs(self.signal_z_er))
+        return drop
+
+    def get_avg_volume_early(self) -> Optional[float]:
+        """Get average volume z-score for first few bars (0-2)."""
+        if len(self.vol_history) < 3:
+            return None
+        return sum(self.vol_history[:3]) / 3
+
+    def get_avg_volume_current(self) -> Optional[float]:
+        """Get average volume z-score for recent bars (3-5)."""
+        if len(self.vol_history) < 6:
+            # Use what we have for bars 3+
+            if len(self.vol_history) > 3:
+                recent = self.vol_history[3:]
+                return sum(recent) / len(recent)
+            return None
+        return sum(self.vol_history[3:6]) / 3
+
+    def get_min_taker_recent(self, last_n_bars: int = 3) -> Optional[float]:
+        """Get minimum taker share over last N bars."""
+        if len(self.taker_history) < last_n_bars:
+            return None
+        return min(self.taker_history[-last_n_bars:])
+
+    def get_price_change_pct(self) -> Optional[float]:
+        """
+        Calculate price change percentage from signal.
+        Positive = price moved in signal direction.
+        """
+        if not self.price_history or self.signal_price == 0:
+            return None
+        current_price = self.price_history[-1]
+        change = (current_price - self.signal_price) / self.signal_price * 100
+        # Adjust for direction: positive means price moved in signal direction
+        if self.original_direction == Direction.DOWN:
+            change = -change
+        return change
 
 
 

@@ -3,7 +3,8 @@
 import asyncio
 import logging
 import numpy as np
-from detector.models import Features, Event, Direction
+from typing import Optional, Tuple
+from detector.models import Features, Event, Direction, SignalClass, TradingMode
 from detector.storage import Storage
 from detector.binance_rest import BinanceRestClient
 from detector.config import Config
@@ -47,47 +48,72 @@ class AnomalyDetector:
 
     async def _process_features(self, features: Features) -> None:
         """Check for initiator signal."""
-        # Check initiator trigger
-        if self._check_initiator_trigger(features):
-            # Check cooldown
-            cooldown_ms = self.config.alerts.cooldown_minutes_per_symbol * 60 * 1000
-            grace_ms = self.config.alerts.direction_swap_grace_minutes * 60 * 1000
+        # Determine if hybrid strategy or legacy mode
+        hybrid_enabled = self.config.hybrid_strategy.enabled
 
-            is_allowed = await self.storage.check_cooldown(
-                features.symbol,
-                features.direction,
-                features.ts_minute,
-                cooldown_ms,
-                grace_ms
-            )
-
-            if not is_allowed:
-                logger.info(f"Cooldown active for {features.symbol} {features.direction.value}, skipping alert")
+        # Check initiator trigger (threshold depends on mode)
+        if hybrid_enabled:
+            signal_class = self._classify_signal(features)
+            if signal_class is None:
+                return  # No signal detected
+        else:
+            # Legacy mode: check standard trigger
+            if not self._check_initiator_trigger(features):
                 return
+            signal_class = None
 
-            # Create event
-            event = Event(
-                event_id=f"{features.symbol}_{features.ts_minute}",
-                ts=features.ts_minute,
-                initiator_symbol=features.symbol,
-                direction=features.direction,
-                metrics=self._extract_metrics(features)
+        # Check cooldown
+        cooldown_ms = self.config.alerts.cooldown_minutes_per_symbol * 60 * 1000
+        grace_ms = self.config.alerts.direction_swap_grace_minutes * 60 * 1000
+
+        is_allowed = await self.storage.check_cooldown(
+            features.symbol,
+            features.direction,
+            features.ts_minute,
+            cooldown_ms,
+            grace_ms
+        )
+
+        if not is_allowed:
+            logger.info(f"Cooldown active for {features.symbol} {features.direction.value}, skipping alert")
+            return
+
+        # Create event with signal classification
+        event = Event(
+            event_id=f"{features.symbol}_{features.ts_minute}",
+            ts=features.ts_minute,
+            initiator_symbol=features.symbol,
+            direction=features.direction,
+            metrics=self._extract_metrics(features),
+            # Hybrid strategy fields
+            signal_class=signal_class,
+            original_z_score=features.z_er_15m,
+            original_vol_z=features.z_vol_15m,
+            original_taker_share=features.taker_buy_share_15m,
+            original_price=None  # Will be set by position manager (has access to bar)
+        )
+
+        # Broadcast to event queues (position manager)
+        for queue in self.event_queues:
+            try:
+                await queue.put(('initiator', event))
+            except Exception as e:
+                logger.error(f"Error broadcasting event to queue: {e}")
+
+        # Write to database
+        await self.storage.write_event(event)
+
+        # NOTE: Cooldown is updated by position_manager AFTER signal is accepted
+        # (not blocked by filters). This ensures cooldown only applies when
+        # a pending signal or position is actually created.
+
+        # Log with signal class if hybrid mode
+        if signal_class:
+            logger.info(
+                f"Hybrid signal detected: {features.symbol} {features.direction.value} "
+                f"class={signal_class.value} z={features.z_er_15m:.2f}"
             )
-
-            # Broadcast to event queues (position manager)
-            for queue in self.event_queues:
-                try:
-                    await queue.put(('initiator', event))
-                except Exception as e:
-                    logger.error(f"Error broadcasting event to queue: {e}")
-
-            # Write to database
-            await self.storage.write_event(event)
-
-            # NOTE: Cooldown is updated by position_manager AFTER signal is accepted
-            # (not blocked by filters). This ensures cooldown only applies when
-            # a pending signal or position is actually created.
-
+        else:
             logger.info(f"Initiator detected: {features.symbol} {features.direction.value}")
 
     def _check_initiator_trigger(self, features: Features) -> bool:
@@ -129,3 +155,48 @@ class AnomalyDetector:
             'beta': features.beta,
             'funding': features.funding_rate or 0,
         }
+
+    def _classify_signal(self, features: Features) -> Optional[SignalClass]:
+        """
+        Classify signal for hybrid strategy based on z-score magnitude.
+
+        Returns:
+            SignalClass or None if no signal detected.
+
+        Classification:
+            - EXTREME_SPIKE: z >= 5.0 (mean-reversion)
+            - STRONG_SIGNAL: 3.0 <= z < 5.0 (conditional momentum)
+            - EARLY_SIGNAL: 1.5 <= z < 3.0 (wait for continuation)
+            - None: z < 1.5 (no signal)
+        """
+        hs_cfg = self.config.hybrid_strategy
+        common_cfg = hs_cfg.common
+
+        # Get absolute z-score
+        z_abs = abs(features.z_er_15m)
+
+        # Volume filter (all modes require minimum volume z-score)
+        if features.z_vol_15m < common_cfg.min_volume_z_for_signal:
+            return None
+
+        # Taker dominance check (bidirectional)
+        taker_share = features.taker_buy_share_15m
+        if taker_share is None or np.isnan(taker_share):
+            return None
+
+        # For hybrid strategy, use common thresholds for taker
+        is_bullish_flow = taker_share >= common_cfg.taker_bullish_threshold
+        is_bearish_flow = taker_share <= common_cfg.taker_bearish_threshold
+
+        if not (is_bullish_flow or is_bearish_flow):
+            return None  # Neutral flow, no signal
+
+        # Classify by z-score magnitude
+        if z_abs >= hs_cfg.extreme_spike_threshold:
+            return SignalClass.EXTREME_SPIKE
+        elif z_abs >= hs_cfg.strong_signal_min:
+            return SignalClass.STRONG_SIGNAL
+        elif z_abs >= hs_cfg.early_signal_min:
+            return SignalClass.EARLY_SIGNAL
+        else:
+            return None  # Below minimum threshold

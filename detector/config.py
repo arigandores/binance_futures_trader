@@ -149,6 +149,215 @@ class WinRateMaxProfileConfig:
     beta_max_abs: float = 3.0  # Renamed from beta_max_value for clarity
 
 
+# =========== HYBRID STRATEGY CONFIGURATION ===========
+
+
+@dataclass
+class ClassFilterConfig:
+    """Per-class filter configuration for class-aware filtering."""
+    # Liquidity thresholds
+    min_volume_usd: float = 100000.0
+    min_trades_per_bar: int = 50
+
+    # Quality filters
+    apply_btc_anomaly_filter: bool = True
+    apply_beta_quality_filter: bool = True
+    beta_min_abs: float = 0.1
+    beta_max_abs: float = 3.0
+    beta_min_r_squared: float = 0.2
+
+    # Symbol restrictions
+    use_global_blacklist: bool = True
+    additional_blacklist: List[str] = field(default_factory=list)
+
+    # Additional filters (for EARLY_SIGNAL)
+    require_recent_volume_spike: bool = False
+    recent_volume_spike_threshold: float = 1.5  # Multiple of average volume
+
+
+@dataclass
+class ClassAwareFiltersConfig:
+    """
+    Class-aware filter configuration.
+
+    Different signal classes have different filter strictness:
+    - EXTREME_SPIKE: Relaxed filters (signal is reliable itself)
+    - STRONG_SIGNAL: Standard filters
+    - EARLY_SIGNAL: Strict filters (weak signals need extra validation)
+    """
+    enabled: bool = False  # Master switch for class-aware filtering
+
+    # EXTREME_SPIKE (z >= 5.0) - Mean-Reversion - Relaxed filters
+    extreme_spike: ClassFilterConfig = field(default_factory=lambda: ClassFilterConfig(
+        min_volume_usd=25000.0,        # Relaxed from 100000
+        min_trades_per_bar=15,         # Relaxed from 50
+        apply_btc_anomaly_filter=True,  # Keep - BTC chaos affects everything
+        apply_beta_quality_filter=False,  # Disabled - beta less important for MR
+        beta_min_abs=0.1,
+        beta_max_abs=3.0,
+        beta_min_r_squared=0.2,
+        use_global_blacklist=True,
+        additional_blacklist=[],
+        require_recent_volume_spike=False,
+        recent_volume_spike_threshold=1.5,
+    ))
+
+    # STRONG_SIGNAL (3.0 <= z < 5.0) - Conditional Momentum - Standard filters
+    strong_signal: ClassFilterConfig = field(default_factory=lambda: ClassFilterConfig(
+        min_volume_usd=100000.0,       # Standard
+        min_trades_per_bar=50,         # Standard
+        apply_btc_anomaly_filter=True,
+        apply_beta_quality_filter=True,
+        beta_min_abs=0.1,
+        beta_max_abs=3.0,
+        beta_min_r_squared=0.2,
+        use_global_blacklist=True,
+        additional_blacklist=[],
+        require_recent_volume_spike=False,
+        recent_volume_spike_threshold=1.5,
+    ))
+
+    # EARLY_SIGNAL (1.5 <= z < 3.0) - Early Momentum - Strict filters
+    early_signal: ClassFilterConfig = field(default_factory=lambda: ClassFilterConfig(
+        min_volume_usd=150000.0,       # Stricter - weak signals need liquidity
+        min_trades_per_bar=75,         # Stricter
+        apply_btc_anomaly_filter=True,
+        apply_beta_quality_filter=True,
+        beta_min_abs=0.15,             # Stricter
+        beta_max_abs=2.5,              # Stricter
+        beta_min_r_squared=0.3,        # Stricter
+        use_global_blacklist=True,
+        additional_blacklist=[],
+        require_recent_volume_spike=True,  # Extra validation for weak signals
+        recent_volume_spike_threshold=1.5,
+    ))
+
+
+@dataclass
+class MeanReversionConfig:
+    """Mean-Reversion mode configuration (EXTREME_SPIKE signals, z >= 5.0)."""
+    # Entry triggers - wait for reversal signs
+    reversal_z_drop_pct: float = 0.20  # Z must drop 20% from signal for entry
+    min_bars_before_entry: int = 2  # Minimum 2 bars before entry allowed
+    max_bars_before_expiry: int = 8  # TTL: max 8 bars
+    require_price_confirmation: bool = True  # Price must move in trade_direction
+    require_volume_fade: bool = True  # Volume must be declining
+
+    # Invalidation conditions
+    invalidate_on_z_growth: bool = True  # Invalidate if z continues growing
+    z_growth_invalidate_threshold: float = 1.10  # If z grows 10% more, invalidate
+    max_volume_growth_bars: int = 3  # Invalidate if volume grows N bars consecutively
+
+    # Exit parameters - quick scalps
+    atr_target_multiplier: float = 1.0  # Quick TP: 1x ATR
+    atr_stop_multiplier: float = 1.2  # Slightly wider stop: 1.2x ATR
+    max_hold_minutes: int = 20  # Short holds
+    z_score_exit_threshold: float = 1.5  # Exit when z normalizes
+    use_trailing_stop: bool = False  # No trailing for quick scalps
+    use_z_exit: bool = True  # Use z-score exit
+
+
+@dataclass
+class ConditionalMomentumConfig:
+    """Conditional Momentum mode configuration (STRONG_SIGNAL, 3.0 <= z < 5.0)."""
+    # Confirmation requirements - ALL must be met
+    min_taker_dominance: float = 0.70  # 70% buyers for LONG, 30% for SHORT
+    min_volume_retention: float = 0.90  # Volume must not drop more than 10%
+    max_z_variance_pct: float = 0.25  # Z variance must be < 25% of signal_z
+    require_no_divergence: bool = True  # Price and z must move together
+    confirmation_bars: int = 3  # Need 3 bars for stability check
+    max_wait_bars: int = 10  # TTL
+
+    # Mode switch conditions (switch to mean-reversion if momentum fails)
+    enable_mode_switch: bool = True
+    mode_switch_z_drop_pct: float = 0.30  # If z drops 30%, switch to MR
+    mode_switch_taker_reversal: float = 0.50  # If taker crosses 50%, switch
+    mode_switch_price_reversal: bool = True  # If price reverses past signal, switch
+
+    # Exit parameters - balanced
+    atr_target_multiplier: float = 2.0
+    atr_stop_multiplier: float = 1.5
+    max_hold_minutes: int = 45
+    z_score_exit_threshold: float = 0.8
+    use_trailing_stop: bool = True
+    trailing_stop_activation_atr: float = 1.0  # Activate at +1 ATR
+    trailing_stop_distance_atr: float = 0.8  # Trail at 0.8 ATR
+    use_z_exit: bool = True
+
+
+@dataclass
+class EarlyMomentumConfig:
+    """Early Momentum mode configuration (EARLY_SIGNAL, 1.5 <= z < 3.0)."""
+    # Continuation criteria - must see momentum building
+    min_z_growth_pct: float = 0.30  # Z must grow 30% from signal
+    min_price_follow_through_pct: float = 0.15  # Price must move 0.15% in direction
+    volume_must_sustain: bool = True  # Volume must not decline
+    min_taker_persistence: float = 0.55  # Min taker over last 3 bars (55% for LONG)
+
+    # Timing
+    min_wait_bars: int = 3  # Must wait at least 3 bars
+    max_wait_bars: int = 5  # TTL: 5 bars
+
+    # Invalidation
+    z_decline_invalidate_pct: float = 0.20  # If z drops 20%, invalidate
+
+    # Exit parameters - long holds for big moves
+    atr_target_multiplier: float = 3.0  # Wide target
+    atr_stop_multiplier: float = 1.5
+    max_hold_minutes: int = 90  # Long holds
+    use_trailing_stop: bool = True
+    trailing_stop_activation_atr: float = 1.5  # Activate later
+    trailing_stop_distance_atr: float = 1.0  # Wider trail
+    use_partial_profit: bool = True  # Take partial at 1.5 ATR
+    partial_profit_target_atr: float = 1.5
+    partial_profit_percent: float = 0.50  # Close 50%
+    use_z_exit: bool = False  # Don't exit on z for early signals - let them run
+
+
+@dataclass
+class HybridCommonConfig:
+    """Common settings for hybrid strategy."""
+    # Volume filter for all signals
+    min_volume_z_for_signal: float = 1.5  # Minimum vol_z for any signal
+
+    # Taker thresholds
+    taker_bullish_threshold: float = 0.55  # >55% = bullish
+    taker_bearish_threshold: float = 0.45  # <45% = bearish
+    taker_extreme_bullish: float = 0.70  # >70% = strong bullish
+    taker_extreme_bearish: float = 0.30  # <30% = strong bearish
+
+    # Position limits
+    max_positions_total: int = 5
+    max_positions_per_mode: int = 2
+
+
+@dataclass
+class HybridStrategyConfig:
+    """
+    Hybrid Strategy configuration.
+
+    Dynamically selects between three trading modes based on signal strength:
+    - EXTREME_SPIKE (z >= 5.0): Mean-reversion (fade the move)
+    - STRONG_SIGNAL (3.0 <= z < 5.0): Conditional momentum (need confirmation)
+    - EARLY_SIGNAL (1.5 <= z < 3.0): Wait for continuation
+    """
+    enabled: bool = False  # Master switch for hybrid strategy
+
+    # Signal classification thresholds
+    extreme_spike_threshold: float = 5.0  # z >= 5.0 = EXTREME_SPIKE
+    strong_signal_min: float = 3.0  # z >= 3.0 = STRONG_SIGNAL
+    early_signal_min: float = 1.5  # z >= 1.5 = EARLY_SIGNAL
+
+    # Mode-specific configurations
+    mean_reversion: MeanReversionConfig = field(default_factory=MeanReversionConfig)
+    conditional_momentum: ConditionalMomentumConfig = field(default_factory=ConditionalMomentumConfig)
+    early_momentum: EarlyMomentumConfig = field(default_factory=EarlyMomentumConfig)
+    common: HybridCommonConfig = field(default_factory=HybridCommonConfig)
+
+    # Class-aware filtering (replaces WIN_RATE_MAX filters when enabled)
+    class_aware_filters: ClassAwareFiltersConfig = field(default_factory=ClassAwareFiltersConfig)
+
+
 @dataclass
 class PositionManagementConfig:
     """Virtual position management configuration."""
@@ -217,6 +426,7 @@ class Config:
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     position_management: PositionManagementConfig = field(default_factory=PositionManagementConfig)
+    hybrid_strategy: HybridStrategyConfig = field(default_factory=HybridStrategyConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @classmethod
@@ -281,6 +491,31 @@ class Config:
                 win_rate_cfg = WinRateMaxProfileConfig(**pm_data['win_rate_max_profile'])
                 pm_data['win_rate_max_profile'] = win_rate_cfg
             config.position_management = PositionManagementConfig(**pm_data)
+
+        # Parse hybrid_strategy configuration
+        if 'hybrid_strategy' in data:
+            hs_data = data['hybrid_strategy'].copy()
+            # Parse nested mode configs
+            if 'mean_reversion' in hs_data:
+                hs_data['mean_reversion'] = MeanReversionConfig(**hs_data['mean_reversion'])
+            if 'conditional_momentum' in hs_data:
+                hs_data['conditional_momentum'] = ConditionalMomentumConfig(**hs_data['conditional_momentum'])
+            if 'early_momentum' in hs_data:
+                hs_data['early_momentum'] = EarlyMomentumConfig(**hs_data['early_momentum'])
+            if 'common' in hs_data:
+                hs_data['common'] = HybridCommonConfig(**hs_data['common'])
+            # Parse class_aware_filters config
+            if 'class_aware_filters' in hs_data:
+                caf_data = hs_data['class_aware_filters'].copy()
+                # Parse per-class configs
+                if 'extreme_spike' in caf_data:
+                    caf_data['extreme_spike'] = ClassFilterConfig(**caf_data['extreme_spike'])
+                if 'strong_signal' in caf_data:
+                    caf_data['strong_signal'] = ClassFilterConfig(**caf_data['strong_signal'])
+                if 'early_signal' in caf_data:
+                    caf_data['early_signal'] = ClassFilterConfig(**caf_data['early_signal'])
+                hs_data['class_aware_filters'] = ClassAwareFiltersConfig(**caf_data)
+            config.hybrid_strategy = HybridStrategyConfig(**hs_data)
 
         if 'runtime' in data:
             config.runtime = RuntimeConfig(**data['runtime'])
