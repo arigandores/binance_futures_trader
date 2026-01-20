@@ -14,6 +14,7 @@ from detector.models import (
 from detector.storage import Storage
 from detector.features_extended import ExtendedFeatureCalculator
 from detector.config import Config
+from detector.trading_improvements import TradingImprovements
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,9 @@ class PositionManager:
         self.extended_features = ExtendedFeatureCalculator(
             atr_period=config.position_management.atr_period
         )
+
+        # Trading improvements module (7 optimizations)
+        self.trading_improvements = TradingImprovements(config, self.extended_features)
 
         # In-memory tracking of open positions
         self.open_positions: Dict[str, Position] = {}  # position_id -> Position
@@ -818,6 +822,57 @@ class PositionManager:
             min_risk_reward=cfg.min_risk_reward_ratio
         )
 
+        # =====================================================================
+        # TRADING IMPROVEMENTS: Pre-entry checks and calculations
+        # =====================================================================
+        signal_class = pending.signal_class
+
+        # Improvement 4: Direction Filters (check before opening)
+        features = self.latest_features.get(symbol)
+        btc_features = self.latest_features.get(self.config.universe.benchmark_symbol)
+        btc_z_er = btc_features.z_er_15m if btc_features else None
+        z_er = features.z_er_15m if features else 0.0
+        vol_z = features.z_vol_15m if features else None
+
+        dir_filter_passed, dir_filter_reason = self.trading_improvements.check_direction_filters(
+            symbol=symbol,
+            signal_class=signal_class,
+            direction=trade_direction,
+            z_er=z_er,
+            btc_z_er=btc_z_er,
+            volume_z=vol_z
+        )
+        if not dir_filter_passed:
+            logger.info(f"{symbol}: Position BLOCKED by direction filter: {dir_filter_reason}")
+            return
+
+        # Improvement 7: Min Profit Filter
+        profit_filter_passed, profit_filter_reason = self.trading_improvements.check_min_profit_filter(
+            symbol=symbol,
+            signal_class=signal_class,
+            direction=trade_direction,
+            entry_price=bar.close
+        )
+        if not profit_filter_passed:
+            logger.info(f"{symbol}: Position BLOCKED by min profit filter: {profit_filter_reason}")
+            return
+
+        # Improvement 1: Calculate Adaptive Stop-Loss
+        adaptive_stop_price, adaptive_stop_mult = self.trading_improvements.calculate_adaptive_stop_loss(
+            symbol=symbol,
+            signal_class=signal_class,
+            direction=trade_direction,
+            entry_price=bar.close
+        )
+
+        # Improvement 2: Calculate Tiered Take-Profit levels
+        tiered_tp = self.trading_improvements.calculate_tiered_tp_levels(
+            symbol=symbol,
+            signal_class=signal_class,
+            direction=trade_direction,
+            entry_price=bar.close
+        )
+
         # Create position with trade direction
         position_id = f"{symbol}_{bar.ts_minute}_{trade_direction.value}_triggered"
         metrics = event.metrics.copy()
@@ -847,6 +902,14 @@ class PositionManager:
         # Generate detailed entry explanation
         entry_details = self._generate_entry_reason_details(pending, bar)
 
+        # Prepare signal class string for Position
+        signal_class_str = signal_class.value if signal_class else None
+
+        # Get trailing stop params for this class (Improvement 5)
+        trail_profit_threshold, trail_distance_atr = self.trading_improvements.get_trailing_params_for_class(
+            signal_class
+        )
+
         position = Position(
             position_id=position_id,
             event_id=event.event_id,
@@ -859,6 +922,17 @@ class PositionManager:
             entry_z_vol=metrics.get('z_vol', 0),
             entry_taker_share=metrics.get('taker_share', 0),
             entry_reason_details=entry_details,
+            # Trading Improvements: Adaptive Stop-Loss
+            adaptive_stop_price=adaptive_stop_price,
+            adaptive_stop_multiplier=adaptive_stop_mult,
+            # Trading Improvements: Tiered Take-Profit
+            tp1_price=tiered_tp.tp1_price if tiered_tp else None,
+            tp2_price=tiered_tp.tp2_price if tiered_tp else None,
+            tp3_price=tiered_tp.tp3_price if tiered_tp else None,
+            # Trading Improvements: Trailing Stop by Class
+            trailing_distance_atr=trail_distance_atr,
+            # Signal class for exit logic
+            signal_class=signal_class_str,
             metrics=metrics
         )
 
@@ -949,6 +1023,13 @@ class PositionManager:
             'mode_switched': pending.mode_switched,
             'z_history_length': len(pending.z_history),
             'price_history_length': len(pending.price_history),
+            # TRADING IMPROVEMENTS metadata
+            'adaptive_stop_price': position.adaptive_stop_price,
+            'adaptive_stop_multiplier': position.adaptive_stop_multiplier,
+            'tp1_price': position.tp1_price,
+            'tp2_price': position.tp2_price,
+            'tp3_price': position.tp3_price,
+            'trailing_distance_atr': position.trailing_distance_atr,
             # Market context
             **market_ctx
         }
@@ -964,54 +1045,145 @@ class PositionManager:
         )
 
     def _generate_entry_reason_details(self, pending: PendingSignal, bar: Bar) -> str:
-        """Generate human-readable detailed explanation for position entry."""
+        """
+        Generate human-readable detailed explanation for position entry.
+
+        Mode-specific messages:
+        - MEAN_REVERSION: reversal, price confirmation, volume fade
+        - CONDITIONAL_MOMENTUM: z-stability, flow confirmation
+        - EARLY_MOMENTUM: continuation, z-growth
+        - DEFAULT (standard): z-cooldown, pullback, dominance
+        """
         cfg = self.config.position_management
-        symbol = pending.symbol
-        direction = "LONG" if pending.direction == Direction.UP else "SHORT"
+        hs_cfg = self.config.hybrid_strategy
 
-        # Calculate pullback from peak
-        pullback_pct = 0.0
-        if pending.peak_since_signal:
-            if pending.direction == Direction.UP:
-                pullback_pct = (pending.peak_since_signal - bar.close) / pending.peak_since_signal * 100
-            else:
-                pullback_pct = (bar.close - pending.peak_since_signal) / pending.peak_since_signal * 100
+        # Determine actual trade direction (may differ for fade strategies)
+        trade_direction = pending.trade_direction if pending.trade_direction else pending.direction
+        trade_dir_str = "SHORT" if trade_direction == Direction.DOWN else "LONG"
+        signal_dir_str = "UP" if pending.direction == Direction.UP else "DOWN"
 
-        # Get taker share
-        taker_share = bar.taker_buy_share()
-        dominance_pct = taker_share * 100 if taker_share else 0
-        if pending.direction == Direction.DOWN:
-            dominance_pct = 100 - dominance_pct  # Sell dominance for SHORT
+        # Wait time (common for all modes)
+        wait_bars = pending.bars_since_signal
+        wait_seconds = (bar.ts_minute - pending.created_ts) // 1000
 
-        # Build entry explanation
         details_parts = []
 
-        # 1. Signal detection
+        # 1. Signal detection (common)
         details_parts.append(
             f"Сигнал: z_ER = {pending.signal_z_er:.2f}σ при цене {format_price(pending.signal_price)}"
         )
 
-        # 2. Z-score cooldown
-        details_parts.append(
-            f"Z-score остыл: диапазон [{cfg.entry_trigger_z_cooldown:.1f}, 3.0]σ ✓"
-        )
+        # Route based on trading mode
+        if pending.trading_mode == TradingMode.MEAN_REVERSION:
+            # MEAN_REVERSION (EXTREME_SPIKE fade) - different triggers
+            mr_cfg = hs_cfg.mean_reversion
 
-        # 3. Pullback
-        details_parts.append(
-            f"Откат: {pullback_pct:.2f}% от пика {format_price(pending.peak_since_signal)} "
-            f"(требуется: ≥{cfg.entry_trigger_pullback_pct:.1f}%) ✓"
-        )
+            # Show that this is a fade trade
+            details_parts.append(
+                f"Fade-сделка: сигнал {signal_dir_str} → позиция {trade_dir_str}"
+            )
 
-        # 4. Flow dominance
-        flow_type = "Buy" if pending.direction == Direction.UP else "Sell"
-        details_parts.append(
-            f"{flow_type}-доминирование: {dominance_pct:.1f}% "
-            f"(требуется: ≥{cfg.entry_trigger_min_taker_dominance * 100:.0f}%) ✓"
-        )
+            # Z-score drop (reversal)
+            z_drop = pending.get_z_drop_pct()
+            z_drop_str = f"{z_drop:.0%}" if z_drop else "N/A"
+            details_parts.append(
+                f"Разворот z-score: -{z_drop_str} (требуется: ≥{mr_cfg.reversal_z_drop_pct:.0%}) ✓"
+            )
 
-        # 5. Wait time
-        wait_bars = pending.bars_since_signal
-        wait_seconds = (bar.ts_minute - pending.created_ts) // 1000
+            # Price confirmation
+            if mr_cfg.require_price_confirmation:
+                price_move = "вниз" if trade_direction == Direction.DOWN else "вверх"
+                details_parts.append(f"Цена подтвердила движение {price_move} ✓")
+
+            # Volume fade
+            if mr_cfg.require_volume_fade and pending.vol_history:
+                current_vol = pending.vol_history[-1] if pending.vol_history else 0
+                details_parts.append(
+                    f"Объём снизился: {current_vol:.2f}σ < {pending.signal_z_vol:.2f}σ ✓"
+                )
+
+        elif pending.trading_mode == TradingMode.CONDITIONAL_MOMENTUM:
+            # CONDITIONAL_MOMENTUM (STRONG_SIGNAL) - stability triggers
+            cm_cfg = hs_cfg.conditional_momentum
+
+            # Z-score stability
+            z_var = pending.get_z_variance(cm_cfg.z_stability_bars)
+            z_var_str = f"{z_var:.4f}" if z_var else "N/A"
+            details_parts.append(
+                f"Z-score стабилен: variance={z_var_str} (max: {cm_cfg.z_stability_variance_max}) ✓"
+            )
+
+            # Flow confirmation (use trade_direction for dominance)
+            taker_share = bar.taker_buy_share()
+            dominance_pct = taker_share * 100 if taker_share else 0
+            if trade_direction == Direction.DOWN:
+                dominance_pct = 100 - dominance_pct
+            flow_type = "Buy" if trade_direction == Direction.UP else "Sell"
+            details_parts.append(
+                f"{flow_type}-доминирование: {dominance_pct:.1f}% (требуется: ≥{cm_cfg.min_taker_dominance * 100:.0f}%) ✓"
+            )
+
+        elif pending.trading_mode == TradingMode.EARLY_MOMENTUM:
+            # EARLY_MOMENTUM (EARLY_SIGNAL) - continuation triggers
+            em_cfg = hs_cfg.early_momentum
+
+            # Wait completed
+            details_parts.append(
+                f"Минимум баров: {pending.bars_since_signal} (требуется: ≥{em_cfg.min_wait_bars}) ✓"
+            )
+
+            # Z-growth
+            z_growth = pending.get_z_growth_pct()
+            z_growth_str = f"{z_growth:.0%}" if z_growth else "N/A"
+            details_parts.append(
+                f"Z-score рост: +{z_growth_str} (требуется: ≥{em_cfg.z_growth_threshold:.0%}) ✓"
+            )
+
+            # Flow continuation (use trade_direction)
+            taker_share = bar.taker_buy_share()
+            dominance_pct = taker_share * 100 if taker_share else 0
+            if trade_direction == Direction.DOWN:
+                dominance_pct = 100 - dominance_pct
+            flow_type = "Buy" if trade_direction == Direction.UP else "Sell"
+            details_parts.append(
+                f"{flow_type}-доминирование: {dominance_pct:.1f}% ✓"
+            )
+
+        else:
+            # DEFAULT mode (standard triggers)
+            # Calculate pullback from peak
+            pullback_pct = 0.0
+            if pending.peak_since_signal:
+                if pending.direction == Direction.UP:
+                    pullback_pct = (pending.peak_since_signal - bar.close) / pending.peak_since_signal * 100
+                else:
+                    pullback_pct = (bar.close - pending.peak_since_signal) / pending.peak_since_signal * 100
+
+            # Get taker share (use trade_direction for correct dominance)
+            taker_share = bar.taker_buy_share()
+            dominance_pct = taker_share * 100 if taker_share else 0
+            if trade_direction == Direction.DOWN:
+                dominance_pct = 100 - dominance_pct
+
+            # Z-score cooldown
+            details_parts.append(
+                f"Z-score остыл: диапазон [{cfg.entry_trigger_z_cooldown:.1f}, 3.0]σ ✓"
+            )
+
+            # Pullback
+            details_parts.append(
+                f"Откат: {pullback_pct:.2f}% от пика {format_price(pending.peak_since_signal)} "
+                f"(требуется: ≥{cfg.entry_trigger_pullback_pct:.1f}%) ✓"
+            )
+
+            # Flow dominance (use trade_direction)
+            flow_type = "Buy" if trade_direction == Direction.UP else "Sell"
+            details_parts.append(
+                f"{flow_type}-доминирование: {dominance_pct:.1f}% "
+                f"(требуется: ≥{cfg.entry_trigger_min_taker_dominance * 100:.0f}%) ✓"
+            )
+
+        # Wait time (common for all modes)
         details_parts.append(
             f"Ожидание: {wait_bars} баров (~{wait_seconds}s)"
         )
@@ -1266,13 +1438,75 @@ class PositionManager:
         ]
 
         for position in positions_to_check:
+            # Update ATR history for volatility percentile calculation
+            self.trading_improvements.update_atr_history(symbol)
+
             # WIN_RATE_MAX: Execute partial profit if target reached (before exit checks)
             await self._execute_partial_profit(position, bar.close, bar.ts_minute)
 
-            # Update trailing stop
+            # =====================================================================
+            # TRADING IMPROVEMENTS: Tiered Take-Profit check (Improvement 2)
+            # Check BEFORE regular exit conditions (high priority)
+            # =====================================================================
+            tiered_tp_result = self.trading_improvements.check_tiered_tp(
+                position, bar.close, bar.ts_minute
+            )
+            if tiered_tp_result:
+                tp_exit_reason, close_pct = tiered_tp_result
+                # Log tiered TP hit
+                logger.info(
+                    f"{symbol}: Tiered TP {tp_exit_reason.value} hit | "
+                    f"Closing {close_pct}% @ {bar.close:.6f}"
+                )
+                # For TP1/TP2 we continue (partial close), TP3 closes everything
+                if tp_exit_reason == ExitReason.TAKE_PROFIT_TP3:
+                    await self._close_position(position, bar, features, tp_exit_reason)
+                    continue
+
+            # =====================================================================
+            # TRADING IMPROVEMENTS: Trailing Stop by Class (Improvement 5)
+            # Check activation and update, then check if hit
+            # =====================================================================
+            self.trading_improvements.check_trailing_stop_activation(
+                position, bar.close, bar.ts_minute
+            )
+            trailing_exit = self.trading_improvements.update_and_check_trailing_stop(
+                position, bar.close
+            )
+            if trailing_exit:
+                await self._close_position(position, bar, features, trailing_exit)
+                continue
+
+            # Update legacy trailing stop (for backward compatibility)
             await self._update_trailing_stop(position, bar.close, features)
 
-            # Then check exit conditions
+            # =====================================================================
+            # TRADING IMPROVEMENTS: Intelligent Time Exit (Improvement 6)
+            # Check BEFORE standard time exit
+            # =====================================================================
+            time_exit_reason = self.trading_improvements.check_time_exit(
+                position, bar.close, bar.ts_minute
+            )
+            if time_exit_reason:
+                await self._close_position(position, bar, features, time_exit_reason)
+                continue
+
+            # =====================================================================
+            # TRADING IMPROVEMENTS: Delayed Z-Exit (Improvement 3)
+            # Replaces standard Z-exit with conditions
+            # =====================================================================
+            z_exit_result = self.trading_improvements.check_delayed_z_exit(
+                position,
+                current_z_er=features.z_er_15m if features.z_er_15m else 0.0,
+                current_price=bar.close,
+                current_ts=bar.ts_minute
+            )
+            if z_exit_result:
+                z_exit_reason, close_pct = z_exit_result
+                await self._close_position(position, bar, features, z_exit_reason)
+                continue
+
+            # Then check remaining exit conditions (SL, legacy TP, order flow, etc.)
             exit_reason = await self._check_exit_conditions(position, features, bar)
 
             if exit_reason:
@@ -2462,18 +2696,35 @@ class PositionManager:
                     )
                     return ExitReason.STOP_LOSS  # Exit at breakeven (0% loss)
 
-        # 3. Fixed Stop Loss check
-        stop_loss_pct = position.metrics.get('dynamic_stop_loss', cfg.stop_loss_percent)
+        # 3. TRADING IMPROVEMENTS: Adaptive Stop-Loss (Improvement 1)
+        # Priority: adaptive_stop_price > sl_moved_to_breakeven > dynamic_stop_loss > fixed %
+        if position.adaptive_stop_price is not None:
+            # Use price-based stop (most accurate)
+            if position.direction == Direction.UP and current_price <= position.adaptive_stop_price:
+                logger.info(
+                    f"{position.symbol}: Adaptive SL triggered "
+                    f"(price {current_price:.6f} <= stop {position.adaptive_stop_price:.6f})"
+                )
+                return ExitReason.STOP_LOSS
+            elif position.direction == Direction.DOWN and current_price >= position.adaptive_stop_price:
+                logger.info(
+                    f"{position.symbol}: Adaptive SL triggered "
+                    f"(price {current_price:.6f} >= stop {position.adaptive_stop_price:.6f})"
+                )
+                return ExitReason.STOP_LOSS
+        else:
+            # Fallback to percentage-based stop
+            stop_loss_pct = position.metrics.get('dynamic_stop_loss', cfg.stop_loss_percent)
 
-        if cfg.use_atr_stops and 'dynamic_stop_loss' not in position.metrics:
-            atr_stop = self.extended_features.get_atr_multiple(
-                position.symbol, position.open_price, cfg.atr_stop_multiplier
-            )
-            if atr_stop:
-                stop_loss_pct = max(stop_loss_pct, atr_stop)
+            if cfg.use_atr_stops and 'dynamic_stop_loss' not in position.metrics:
+                atr_stop = self.extended_features.get_atr_multiple(
+                    position.symbol, position.open_price, cfg.atr_stop_multiplier
+                )
+                if atr_stop:
+                    stop_loss_pct = max(stop_loss_pct, atr_stop)
 
-        if pnl_pct <= -stop_loss_pct:
-            return ExitReason.STOP_LOSS
+            if pnl_pct <= -stop_loss_pct:
+                return ExitReason.STOP_LOSS
 
         # 4. Take Profit check
         take_profit_pct = position.metrics.get('dynamic_take_profit', cfg.take_profit_percent)
@@ -2562,7 +2813,13 @@ class PositionManager:
         duration_minutes = (bar.ts_minute - position.open_ts) // (60 * 1000)
 
         if exit_reason == ExitReason.TRAILING_STOP:
-            trailing_price = position.metrics.get('trailing_stop_price', 0)
+            # Check both storage locations: position attribute (trading_improvements)
+            # and metrics dict (legacy position_manager)
+            trailing_price = (
+                position.trailing_price
+                or position.metrics.get('trailing_stop_price')
+                or 0
+            )
             return (
                 f"Трейлинг-стоп сработал: цена {format_price(current_price)} достигла "
                 f"трейлинг-уровня {format_price(trailing_price)}. "
@@ -2721,6 +2978,20 @@ class PositionManager:
             'trading_mode': position.metrics.get('trading_mode'),
             'original_direction': position.metrics.get('original_direction'),
             'mode_switched': position.metrics.get('mode_switched', False),
+            # TRADING IMPROVEMENTS metadata
+            'adaptive_stop_price': position.adaptive_stop_price,
+            'adaptive_stop_multiplier': position.adaptive_stop_multiplier,
+            'tp1_price': position.tp1_price,
+            'tp2_price': position.tp2_price,
+            'tp3_price': position.tp3_price,
+            'tp1_hit': position.tp1_hit,
+            'tp2_hit': position.tp2_hit,
+            'tp3_hit': position.tp3_hit,
+            'remaining_quantity_pct': position.remaining_quantity_pct,
+            'sl_moved_to_breakeven': position.sl_moved_to_breakeven,
+            'trailing_active': position.trailing_active,
+            'trailing_price': position.trailing_price,
+            'trailing_distance_atr': position.trailing_distance_atr,
             # Market context at exit
             **market_ctx
         }
@@ -3000,14 +3271,38 @@ class PositionManager:
 🕐 Time: {timestamp}
 🆔 ID: {position.position_id}
 
-⚙️ <b>Exit Settings:</b>
-   • Stop Loss: {self.config.position_management.stop_loss_percent}%
-   • Take Profit: {self.config.position_management.take_profit_percent}%
-   • Max Hold: {self.config.position_management.max_hold_minutes}m
+⚙️ <b>Exit Settings (Trading Improvements):</b>
 """
+
+        # Add Adaptive Stop-Loss info
+        if position.adaptive_stop_price:
+            message += f"   • 🎯 Adaptive SL: {format_price(position.adaptive_stop_price)}"
+            if position.adaptive_stop_multiplier:
+                message += f" ({position.adaptive_stop_multiplier:.2f}x ATR)\n"
+            else:
+                message += "\n"
+        else:
+            message += f"   • Stop Loss: {self.config.position_management.stop_loss_percent}%\n"
+
+        # Add Tiered Take-Profit levels
+        if position.tp1_price:
+            message += f"   • 📊 TP1: {format_price(position.tp1_price)} (30%)\n"
+        if position.tp2_price:
+            message += f"   • 📊 TP2: {format_price(position.tp2_price)} (30%)\n"
+        if position.tp3_price:
+            message += f"   • 📊 TP3: {format_price(position.tp3_price)} (40%)\n"
+
+        if not position.tp1_price:
+            message += f"   • Take Profit: {self.config.position_management.take_profit_percent}%\n"
+
+        message += f"   • Max Hold: {self.config.position_management.max_hold_minutes}m\n"
 
         if self.config.position_management.use_atr_stops:
             message += f"   • ATR Stop: {self.config.position_management.atr_stop_multiplier}x ATR\n"
+
+        # Add trailing stop class info
+        if position.trailing_distance_atr:
+            message += f"   • 📈 Trail Distance: {position.trailing_distance_atr:.1f}x ATR\n"
 
         return message
 
@@ -3029,23 +3324,35 @@ class PositionManager:
         # Exit reason emoji
         exit_emoji_map = {
             ExitReason.TAKE_PROFIT: "🎯",
+            ExitReason.TAKE_PROFIT_TP1: "🎯",
+            ExitReason.TAKE_PROFIT_TP2: "🎯",
+            ExitReason.TAKE_PROFIT_TP3: "🎯",
             ExitReason.STOP_LOSS: "🛑",
             ExitReason.TRAILING_STOP: "📈",
             ExitReason.Z_SCORE_REVERSAL: "📉",
+            ExitReason.Z_SCORE_REVERSAL_PARTIAL: "📉",
             ExitReason.ORDER_FLOW_REVERSAL: "🔄",
             ExitReason.TIME_EXIT: "⏱️",
+            ExitReason.TIME_EXIT_LOSING: "⏱️",
+            ExitReason.TIME_EXIT_FLAT: "⏱️",
             ExitReason.OPPOSITE_SIGNAL: "⚡"
         }
         exit_emoji = exit_emoji_map.get(position.exit_reason, "🚪")
 
-        # Human-readable exit reason names
+        # Human-readable exit reason names (Trading Improvements)
         exit_reason_names = {
             ExitReason.TAKE_PROFIT: "🎯 Тейк-профит",
+            ExitReason.TAKE_PROFIT_TP1: "🎯 TP1 (30%)",
+            ExitReason.TAKE_PROFIT_TP2: "🎯 TP2 (60%)",
+            ExitReason.TAKE_PROFIT_TP3: "🎯 TP3 (100%)",
             ExitReason.STOP_LOSS: "🛑 Стоп-лосс",
             ExitReason.TRAILING_STOP: "📈 Трейлинг-стоп",
             ExitReason.Z_SCORE_REVERSAL: "📉 Z-score ослаб",
+            ExitReason.Z_SCORE_REVERSAL_PARTIAL: "📉 Z-score (partial)",
             ExitReason.ORDER_FLOW_REVERSAL: "🔄 Разворот потока",
             ExitReason.TIME_EXIT: "⏱️ Выход по времени",
+            ExitReason.TIME_EXIT_LOSING: "⏱️ Time Exit (убыток)",
+            ExitReason.TIME_EXIT_FLAT: "⏱️ Time Exit (flat)",
             ExitReason.OPPOSITE_SIGNAL: "⚡ Противосигнал"
         }
         exit_reason_display = exit_reason_names.get(position.exit_reason, position.exit_reason.value if position.exit_reason else 'N/A')

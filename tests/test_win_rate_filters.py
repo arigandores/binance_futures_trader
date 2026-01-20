@@ -38,6 +38,14 @@ def config_win_rate_max():
     )
     # Ensure WIN_RATE_MAX profile config exists
     config.position_management.win_rate_max_profile = WinRateMaxProfileConfig()
+    # Disable Trading Improvements filters for tests (to allow any position to open)
+    config.position_management.direction_filters.enabled = False
+    config.position_management.min_profit_filter.enabled = False
+    config.position_management.adaptive_stop_loss.enabled = False
+    config.position_management.tiered_take_profit.enabled = False
+    config.position_management.trailing_stop_by_class.enabled = False
+    config.position_management.time_exit.enabled = False
+    config.position_management.delayed_z_exit.enabled = False
     return config
 
 

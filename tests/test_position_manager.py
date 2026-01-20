@@ -31,6 +31,14 @@ def config():
     cfg.position_management.order_flow_reversal_threshold = 0.15
     cfg.position_management.exit_on_opposite_signal = False
     cfg.position_management.opposite_signal_threshold = 2.5
+    # Disable Trading Improvements filters for tests (to allow any position to open)
+    cfg.position_management.direction_filters.enabled = False
+    cfg.position_management.min_profit_filter.enabled = False
+    cfg.position_management.adaptive_stop_loss.enabled = False
+    cfg.position_management.tiered_take_profit.enabled = False
+    cfg.position_management.trailing_stop_by_class.enabled = False
+    cfg.position_management.time_exit.enabled = False
+    cfg.position_management.delayed_z_exit.enabled = False
     return cfg
 
 

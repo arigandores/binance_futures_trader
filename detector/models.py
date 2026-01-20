@@ -372,9 +372,15 @@ class PositionStatus(str, Enum):
 class ExitReason(str, Enum):
     """Reason for position exit."""
     Z_SCORE_REVERSAL = "Z_SCORE_REVERSAL"  # z_er fell below threshold
+    Z_SCORE_REVERSAL_PARTIAL = "Z_SCORE_REVERSAL_PARTIAL"  # Delayed z-exit: partial close
     STOP_LOSS = "STOP_LOSS"  # Price moved against position
-    TAKE_PROFIT = "TAKE_PROFIT"  # Target profit reached
+    TAKE_PROFIT = "TAKE_PROFIT"  # Target profit reached (legacy single TP)
+    TAKE_PROFIT_TP1 = "TAKE_PROFIT_TP1"  # Tiered TP: first level (30%)
+    TAKE_PROFIT_TP2 = "TAKE_PROFIT_TP2"  # Tiered TP: second level (30%)
+    TAKE_PROFIT_TP3 = "TAKE_PROFIT_TP3"  # Tiered TP: final level (40%)
     TIME_EXIT = "TIME_EXIT"  # Maximum holding time reached
+    TIME_EXIT_LOSING = "TIME_EXIT_LOSING"  # Aggressive exit: losing position timeout
+    TIME_EXIT_FLAT = "TIME_EXIT_FLAT"  # Aggressive exit: flat position timeout
     OPPOSITE_SIGNAL = "OPPOSITE_SIGNAL"  # Strong opposite direction signal
     ORDER_FLOW_REVERSAL = "ORDER_FLOW_REVERSAL"  # Taker buy/sell ratio reversed
     TRAILING_STOP = "TRAILING_STOP"  # Trailing stop triggered after reaching profit target
@@ -418,6 +424,30 @@ class Position:
     partial_profit_price: Optional[float] = None
     partial_profit_pnl_percent: Optional[float] = None
     partial_profit_ts: Optional[int] = None
+
+    # =========== TIERED TAKE-PROFIT (Улучшение 2) ===========
+    # TP levels calculated at entry (based on ATR and signal class)
+    tp1_price: Optional[float] = None
+    tp2_price: Optional[float] = None
+    tp3_price: Optional[float] = None
+    tp1_hit: bool = False  # First level reached (30%)
+    tp2_hit: bool = False  # Second level reached (30%)
+    tp3_hit: bool = False  # Final level reached (40%)
+    remaining_quantity_pct: float = 100.0  # Remaining position size (%)
+    sl_moved_to_breakeven: bool = False  # SL moved to entry after TP1
+
+    # =========== ADAPTIVE STOP-LOSS (Улучшение 1) ===========
+    adaptive_stop_price: Optional[float] = None  # Dynamically calculated stop
+    adaptive_stop_multiplier: Optional[float] = None  # Final calculated multiplier
+
+    # =========== TRAILING STOP BY CLASS (Улучшение 5) ===========
+    trailing_active: bool = False
+    trailing_price: Optional[float] = None  # Current trail level
+    trailing_activation_profit: Optional[float] = None  # Profit % when activated
+    trailing_distance_atr: Optional[float] = None  # ATR distance for this position
+
+    # =========== SIGNAL CLASS (for class-based logic) ===========
+    signal_class: Optional[str] = None  # EXTREME_SPIKE, STRONG_SIGNAL, EARLY_SIGNAL
 
     # Additional metrics
     metrics: Dict[str, Any] = field(default_factory=dict)

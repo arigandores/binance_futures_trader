@@ -359,6 +359,218 @@ class HybridStrategyConfig:
 
 
 @dataclass
+class AdaptiveStopLossConfig:
+    """
+    Улучшение 1: Адаптивный Stop-Loss.
+    SL multiplier зависит от signal class, volatility regime и direction.
+    """
+    enabled: bool = True
+
+    # Base multipliers по классам сигналов
+    base_multiplier_extreme_spike: float = 1.5  # MR сделки короткие
+    base_multiplier_strong_signal: float = 1.8  # Стандартный momentum
+    base_multiplier_early_signal: float = 2.0   # Ранний вход, нужно пространство
+
+    # Volatility adjustment
+    volatility_adjustment_enabled: bool = True
+    volatility_lookback_bars: int = 1440  # 24 часа на 1m bars
+    high_volatility_percentile: int = 75
+    high_volatility_multiplier: float = 1.5  # Расширить стоп
+    low_volatility_percentile: int = 25
+    low_volatility_multiplier: float = 0.75  # Сузить стоп
+
+    # Direction adjustment (лонги рискованнее)
+    direction_adjustment_enabled: bool = True
+    long_additional_multiplier: float = 1.15  # На 15% шире для лонгов
+    short_additional_multiplier: float = 1.0
+
+    # Safety limits
+    min_stop_distance_pct: float = 0.3  # Минимум 0.3% от entry
+    max_stop_distance_pct: float = 5.0  # Максимум 5% от entry
+
+
+@dataclass
+class TieredTakeProfitLevelConfig:
+    """Configuration for one TP level."""
+    atr_multiplier: float = 0.5
+    close_percent: int = 30
+
+
+@dataclass
+class TieredTakeProfitConfig:
+    """
+    Улучшение 2: Tiered Take-Profit с частичным закрытием.
+    Вместо одного далёкого TP — три уровня с частичным закрытием.
+    """
+    enabled: bool = True
+
+    # EXTREME_SPIKE уровни (быстрые MR сделки)
+    extreme_spike_tp1_atr: float = 0.4
+    extreme_spike_tp1_close_pct: int = 30
+    extreme_spike_tp2_atr: float = 0.8
+    extreme_spike_tp2_close_pct: int = 30
+    extreme_spike_tp3_atr: float = 1.2
+    extreme_spike_tp3_close_pct: int = 40
+
+    # STRONG_SIGNAL уровни (стандартный momentum)
+    strong_signal_tp1_atr: float = 0.5
+    strong_signal_tp1_close_pct: int = 30
+    strong_signal_tp2_atr: float = 1.0
+    strong_signal_tp2_close_pct: int = 30
+    strong_signal_tp3_atr: float = 1.5
+    strong_signal_tp3_close_pct: int = 40
+
+    # EARLY_SIGNAL уровни (ловим большое движение)
+    early_signal_tp1_atr: float = 0.6
+    early_signal_tp1_close_pct: int = 30
+    early_signal_tp2_atr: float = 1.2
+    early_signal_tp2_close_pct: int = 30
+    early_signal_tp3_atr: float = 2.0
+    early_signal_tp3_close_pct: int = 40
+
+    # Actions после достижения уровней
+    move_sl_breakeven_on_tp1: bool = True  # Перенести SL в breakeven после TP1
+    activate_trailing_on_tp2: bool = True   # Активировать trailing после TP2
+
+
+@dataclass
+class DelayedZExitConfig:
+    """
+    Улучшение 3: Отложенный Z-Score Exit.
+    Добавляет условия задержки для Z-exit: минимальный profit и время.
+    """
+    enabled: bool = True
+
+    # EXTREME_SPIKE условия (самые мягкие для быстрых MR)
+    extreme_spike_min_profit_pct: float = 0.15
+    extreme_spike_min_hold_minutes: int = 2
+    extreme_spike_partial_close_pct: int = 60
+
+    # STRONG_SIGNAL условия
+    strong_signal_min_profit_pct: float = 0.20
+    strong_signal_min_hold_minutes: int = 3
+    strong_signal_partial_close_pct: int = 50
+
+    # EARLY_SIGNAL условия
+    early_signal_min_profit_pct: float = 0.25
+    early_signal_min_hold_minutes: int = 4
+    early_signal_partial_close_pct: int = 50
+
+    # Partial close при Z-exit
+    partial_close_enabled: bool = True
+    skip_partial_if_tp1_hit: bool = True  # Если TP1 уже был — закрыть полностью
+
+
+@dataclass
+class DirectionFiltersConfig:
+    """
+    Улучшение 4: Асимметричная фильтрация Long/Short.
+    Разные требования для входа в long и short позиции.
+    """
+    enabled: bool = True
+
+    # LONG требования (строже, т.к. лонги хуже)
+    long_min_extreme_spike_z: float = 6.0  # Выше чем для short (5.0)
+    long_min_strong_signal_z: float = 3.5   # Выше чем для short (3.0)
+    long_pullback_multiplier: float = 1.25   # На 25% больше pullback
+    long_volume_multiplier: float = 1.2      # На 20% больше volume
+
+    # BTC filter для LONG
+    long_btc_filter_enabled: bool = True
+    long_btc_block_threshold: float = -2.0   # Блокировать если BTC z < -2.0
+    long_btc_restrict_threshold: float = -1.0  # Ограничить если BTC z < -1.0
+
+    # Опционально отключить LONG для EARLY_SIGNAL
+    long_disable_for_early_signal: bool = False
+
+    # SHORT требования (стандартные)
+    short_min_extreme_spike_z: float = 5.0
+    short_min_strong_signal_z: float = 3.0
+    short_pullback_multiplier: float = 1.0
+    short_volume_multiplier: float = 1.0
+    short_btc_filter_enabled: bool = False
+
+
+@dataclass
+class TrailingStopByClassConfig:
+    """
+    Улучшение 5: Активация Trailing Stop по классам.
+    Разные параметры активации и дистанции для разных классов.
+    """
+    enabled: bool = True
+
+    # EXTREME_SPIKE (ранняя активация, tight trail)
+    extreme_spike_profit_threshold_pct: float = 0.25
+    extreme_spike_distance_atr: float = 0.5
+
+    # STRONG_SIGNAL (стандартная)
+    strong_signal_profit_threshold_pct: float = 0.35
+    strong_signal_distance_atr: float = 0.7
+
+    # EARLY_SIGNAL (поздняя активация, wide trail)
+    early_signal_profit_threshold_pct: float = 0.45
+    early_signal_distance_atr: float = 1.0
+
+    # Behavior
+    activate_on_tp2: bool = True  # Авто-активация при TP2
+    update_frequency: str = "every_bar"
+    use_close_price: bool = True  # Сравнивать с close, не high/low
+
+
+@dataclass
+class TimeExitConfig:
+    """
+    Улучшение 6: Интеллектуальный Time Exit.
+    Aggressive time exit для убыточных и flat позиций.
+    """
+    enabled: bool = True
+
+    # EXTREME_SPIKE (самые строгие time limits)
+    extreme_spike_losing_threshold_pct: float = -0.25
+    extreme_spike_losing_max_minutes: int = 4
+    extreme_spike_flat_threshold_pct: float = 0.1
+    extreme_spike_flat_max_minutes: int = 6
+    extreme_spike_max_hold_minutes: int = 20
+
+    # STRONG_SIGNAL
+    strong_signal_losing_threshold_pct: float = -0.30
+    strong_signal_losing_max_minutes: int = 5
+    strong_signal_flat_threshold_pct: float = 0.1
+    strong_signal_flat_max_minutes: int = 8
+    strong_signal_max_hold_minutes: int = 45
+
+    # EARLY_SIGNAL (самые мягкие)
+    early_signal_losing_threshold_pct: float = -0.35
+    early_signal_losing_max_minutes: int = 6
+    early_signal_flat_threshold_pct: float = 0.1
+    early_signal_flat_max_minutes: int = 10
+    early_signal_max_hold_minutes: int = 90
+
+
+@dataclass
+class MinProfitFilterConfig:
+    """
+    Улучшение 7: Минимальный Profit Filter.
+    Не открывать позицию если expected profit слишком мал.
+    """
+    enabled: bool = True
+
+    # Fees estimation
+    estimated_fees_pct: float = 0.10  # Round-trip fees (0.04% * 2 + buffer)
+
+    # Minimum expected profit (до комиссий)
+    min_expected_profit_pct: float = 0.35
+
+    # Check against TP level
+    check_against: str = "tp1"  # "tp1", "tp2", "tp3"
+
+    # Per-class thresholds (опционально)
+    extreme_spike_min_profit_pct: float = 0.30
+    strong_signal_min_profit_pct: float = 0.35
+    early_signal_min_profit_pct: float = 0.40
+
+
+@dataclass
 class PositionManagementConfig:
     """Virtual position management configuration."""
     enabled: bool = True
@@ -405,6 +617,15 @@ class PositionManagementConfig:
 
     # WIN_RATE_MAX profile configuration
     win_rate_max_profile: WinRateMaxProfileConfig = field(default_factory=WinRateMaxProfileConfig)
+
+    # =========== TRADING IMPROVEMENTS (7 улучшений) ===========
+    adaptive_stop_loss: AdaptiveStopLossConfig = field(default_factory=AdaptiveStopLossConfig)
+    tiered_take_profit: TieredTakeProfitConfig = field(default_factory=TieredTakeProfitConfig)
+    delayed_z_exit: DelayedZExitConfig = field(default_factory=DelayedZExitConfig)
+    direction_filters: DirectionFiltersConfig = field(default_factory=DirectionFiltersConfig)
+    trailing_stop_by_class: TrailingStopByClassConfig = field(default_factory=TrailingStopByClassConfig)
+    time_exit: TimeExitConfig = field(default_factory=TimeExitConfig)
+    min_profit_filter: MinProfitFilterConfig = field(default_factory=MinProfitFilterConfig)
 
 
 @dataclass
@@ -485,11 +706,26 @@ class Config:
         # Ignore 'diffusion' section for backward compatibility (removed feature)
 
         if 'position_management' in data:
-            pm_data = data['position_management']
+            pm_data = data['position_management'].copy()
             # Parse WIN_RATE_MAX profile if present
             if 'win_rate_max_profile' in pm_data:
                 win_rate_cfg = WinRateMaxProfileConfig(**pm_data['win_rate_max_profile'])
                 pm_data['win_rate_max_profile'] = win_rate_cfg
+            # Parse Trading Improvements configs (7 улучшений)
+            if 'adaptive_stop_loss' in pm_data:
+                pm_data['adaptive_stop_loss'] = AdaptiveStopLossConfig(**pm_data['adaptive_stop_loss'])
+            if 'tiered_take_profit' in pm_data:
+                pm_data['tiered_take_profit'] = TieredTakeProfitConfig(**pm_data['tiered_take_profit'])
+            if 'delayed_z_exit' in pm_data:
+                pm_data['delayed_z_exit'] = DelayedZExitConfig(**pm_data['delayed_z_exit'])
+            if 'direction_filters' in pm_data:
+                pm_data['direction_filters'] = DirectionFiltersConfig(**pm_data['direction_filters'])
+            if 'trailing_stop_by_class' in pm_data:
+                pm_data['trailing_stop_by_class'] = TrailingStopByClassConfig(**pm_data['trailing_stop_by_class'])
+            if 'time_exit' in pm_data:
+                pm_data['time_exit'] = TimeExitConfig(**pm_data['time_exit'])
+            if 'min_profit_filter' in pm_data:
+                pm_data['min_profit_filter'] = MinProfitFilterConfig(**pm_data['min_profit_filter'])
             config.position_management = PositionManagementConfig(**pm_data)
 
         # Parse hybrid_strategy configuration
