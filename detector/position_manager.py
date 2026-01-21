@@ -2651,25 +2651,35 @@ class PositionManager:
         bar: Bar
     ) -> Optional[ExitReason]:
         """
-        Check all exit conditions with new priority order.
+        Check all exit conditions with CORRECTED priority order.
 
-        Exit priority (revised):
-        1. Trailing Stop (if activated and hit)
-        2. Breakeven Stop (WIN_RATE_MAX: after partial profit, SL at entry)
-        3. Fixed Stop Loss (protect capital)
-        4. Take Profit (lock in gains)
-        5. Z-Score Reversal (signal weakened - now more lenient at 0.5)
-        6. Order Flow Reversal
-        7. WIN_RATE_MAX Time Exit (stricter: 25m, must be +0.5xATR)
-        8. Default Time Exit (120 minutes)
+        CRITICAL FIX v2: Exit priority REORDERED with TIME_EXIT_LOSING moved to LAST:
+        1. Trailing Stop (if activated and hit) - HIGHEST (protect profits)
+        2. Breakeven Stop - SECOND (protect capital at entry)
+        3. Fixed Stop Loss - THIRD (protect from big losses)
+        4. TAKE_PROFIT - FOURTH (lock in target gains)
+        5. Z-Score Reversal - FIFTH (signal ended)
+        6. Order Flow Reversal - SIXTH
+        7. Opposite Signal - SEVENTH
+        8. Max Hold Time Exit - EIGHTH (time limit)
+        9. TIME_EXIT_LOSING - LAST (only if nothing else worked)
+
+        CRITICAL: Grace period check ensures aggressive exits don't fire too early.
         """
         cfg = self.config.position_management
         direction_multiplier = 1 if position.direction == Direction.UP else -1
 
         current_price = bar.close
         pnl_pct = ((current_price - position.open_price) / position.open_price * 100) * direction_multiplier
+        duration_minutes = (bar.ts_minute - position.open_ts) // (60 * 1000)
 
-        # 1. Trailing Stop check (highest priority if activated)
+        # CRITICAL FIX v2: Check grace period
+        # During grace period, only SL/TP are allowed (no aggressive time exits)
+        in_grace_period = duration_minutes < cfg.grace_period_minutes
+
+        # =====================================================================
+        # 1. TRAILING STOP - HIGHEST PRIORITY (protect unrealized gains)
+        # =====================================================================
         if position.metrics.get('trailing_stop_active'):
             trailing_stop_price = position.metrics.get('trailing_stop_price')
 
@@ -2679,7 +2689,9 @@ class PositionManager:
                 elif position.direction == Direction.DOWN and current_price >= trailing_stop_price:
                     return ExitReason.TRAILING_STOP
 
-        # 2. Breakeven Stop check (WIN_RATE_MAX: after partial profit executed)
+        # =====================================================================
+        # 2. BREAKEVEN STOP - SECOND (WIN_RATE_MAX: after partial profit)
+        # =====================================================================
         if position.metrics.get('breakeven_stop_active'):
             breakeven_price = position.metrics.get('breakeven_stop_price')
             if breakeven_price is not None:
@@ -2696,7 +2708,9 @@ class PositionManager:
                     )
                     return ExitReason.STOP_LOSS  # Exit at breakeven (0% loss)
 
-        # 3. TRADING IMPROVEMENTS: Adaptive Stop-Loss (Improvement 1)
+        # =====================================================================
+        # 3. STOP LOSS - THIRD (protect capital from big losses)
+        # =====================================================================
         # Priority: adaptive_stop_price > sl_moved_to_breakeven > dynamic_stop_loss > fixed %
         if position.adaptive_stop_price is not None:
             # Use price-based stop (most accurate)
@@ -2726,15 +2740,16 @@ class PositionManager:
             if pnl_pct <= -stop_loss_pct:
                 return ExitReason.STOP_LOSS
 
-        # 4. Take Profit check
+        # =====================================================================
+        # 4. TAKE PROFIT - FOURTH (lock in target gains)
+        # =====================================================================
         take_profit_pct = position.metrics.get('dynamic_take_profit', cfg.take_profit_percent)
-
         if pnl_pct >= take_profit_pct:
             return ExitReason.TAKE_PROFIT
 
-        # 5. Z-Score Reversal check (direction-aware for Mean-Reversion)
-        # For Mean-Reversion: direction-specific exit (not abs)
-        # For Momentum: standard abs() exit
+        # =====================================================================
+        # 5. Z-SCORE REVERSAL - FIFTH (signal weakened)
+        # =====================================================================
         trading_mode = position.metrics.get('trading_mode')
         original_direction = position.metrics.get('original_direction')
 
@@ -2766,13 +2781,9 @@ class PositionManager:
             if abs(features.z_er_15m) < cfg.z_score_exit_threshold:
                 return ExitReason.Z_SCORE_REVERSAL
 
-        # 6. Opposite Signal check (strong signal in opposite direction)
-        if cfg.exit_on_opposite_signal:
-            opposite_direction = Direction.DOWN if position.direction == Direction.UP else Direction.UP
-            if features.direction == opposite_direction and abs(features.z_er_15m) >= cfg.opposite_signal_threshold:
-                return ExitReason.OPPOSITE_SIGNAL
-
-        # 7. Order Flow Reversal check
+        # =====================================================================
+        # 6. ORDER FLOW REVERSAL - SIXTH
+        # =====================================================================
         if cfg.exit_on_order_flow_reversal:
             extended = self.extended_features.update(bar)
             taker_delta = extended.get('taker_flow_delta')
@@ -2786,14 +2797,28 @@ class PositionManager:
                 elif position.direction == Direction.DOWN and taker_delta > threshold:
                     return ExitReason.ORDER_FLOW_REVERSAL
 
-        # 8. WIN_RATE_MAX Time Exit (stricter: must be profitable after N minutes)
-        if self._check_time_exit(position, current_price, bar.ts_minute):
-            return ExitReason.TIME_EXIT
+        # =====================================================================
+        # 7. OPPOSITE SIGNAL - SEVENTH
+        # =====================================================================
+        if cfg.exit_on_opposite_signal:
+            opposite_direction = Direction.DOWN if position.direction == Direction.UP else Direction.UP
+            if features.direction == opposite_direction and abs(features.z_er_15m) >= cfg.opposite_signal_threshold:
+                return ExitReason.OPPOSITE_SIGNAL
 
-        # 9. Default Time Exit check (max hold time)
+        # =====================================================================
+        # 8. MAX HOLD TIME EXIT - EIGHTH (time limit reached)
+        # =====================================================================
         if cfg.max_hold_minutes > 0:
-            duration_minutes = (bar.ts_minute - position.open_ts) // (60 * 1000)
             if duration_minutes >= cfg.max_hold_minutes:
+                return ExitReason.TIME_EXIT
+
+        # =====================================================================
+        # 9. TIME_EXIT_LOSING - LAST (aggressive exit, only if nothing else worked)
+        # CRITICAL FIX v2: Check AFTER all other exits, respects grace period
+        # =====================================================================
+        if not in_grace_period:
+            # WIN_RATE_MAX Time Exit (stricter: must be profitable after N minutes)
+            if self._check_time_exit(position, current_price, bar.ts_minute):
                 return ExitReason.TIME_EXIT
 
         return None

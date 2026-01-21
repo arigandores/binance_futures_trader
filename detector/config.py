@@ -363,30 +363,33 @@ class AdaptiveStopLossConfig:
     """
     Улучшение 1: Адаптивный Stop-Loss.
     SL multiplier зависит от signal class, volatility regime и direction.
+
+    CRITICAL FIX v2: Avg Loss вырос с -0.78% до -1.99%.
+    Уменьшены базовые множители и volatility adjustment для более тугих стопов.
     """
     enabled: bool = True
 
-    # Base multipliers по классам сигналов
-    base_multiplier_extreme_spike: float = 1.5  # MR сделки короткие
-    base_multiplier_strong_signal: float = 1.8  # Стандартный momentum
-    base_multiplier_early_signal: float = 2.0   # Ранний вход, нужно пространство
+    # Base multipliers по классам сигналов (УМЕНЬШЕНЫ в v2)
+    base_multiplier_extreme_spike: float = 1.2  # Было 1.5, теперь 1.2
+    base_multiplier_strong_signal: float = 1.4  # Было 1.8, теперь 1.4
+    base_multiplier_early_signal: float = 1.6   # Было 2.0, теперь 1.6
 
-    # Volatility adjustment
+    # Volatility adjustment (УМЕНЬШЕНЫ в v2)
     volatility_adjustment_enabled: bool = True
     volatility_lookback_bars: int = 1440  # 24 часа на 1m bars
     high_volatility_percentile: int = 75
-    high_volatility_multiplier: float = 1.5  # Расширить стоп
+    high_volatility_multiplier: float = 1.3  # Было 1.5, теперь 1.3
     low_volatility_percentile: int = 25
-    low_volatility_multiplier: float = 0.75  # Сузить стоп
+    low_volatility_multiplier: float = 0.85  # Было 0.75, теперь 0.85
 
     # Direction adjustment (лонги рискованнее)
     direction_adjustment_enabled: bool = True
     long_additional_multiplier: float = 1.15  # На 15% шире для лонгов
     short_additional_multiplier: float = 1.0
 
-    # Safety limits
+    # Safety limits (УМЕНЬШЕН max в v2)
     min_stop_distance_pct: float = 0.3  # Минимум 0.3% от entry
-    max_stop_distance_pct: float = 5.0  # Максимум 5% от entry
+    max_stop_distance_pct: float = 3.0  # Было 5.0, теперь 3.0
 
 
 @dataclass
@@ -438,8 +441,16 @@ class DelayedZExitConfig:
     """
     Улучшение 3: Отложенный Z-Score Exit.
     Добавляет условия задержки для Z-exit: минимальный profit и время.
+
+    CRITICAL FIX v2: Delayed Z-Exit держит losers слишком долго.
+    Добавлен флаг require_min_profit для отключения требования min profit.
+    Если require_min_profit=false, Z-exit срабатывает без задержки (стандартное поведение).
     """
-    enabled: bool = True
+    enabled: bool = False  # ИЗМЕНЕНО в v2: отключено по умолчанию
+
+    # CRITICAL FIX v2: Убрать требование min profit
+    # Если false - Z-exit срабатывает без задержки на profit (обычное поведение)
+    require_min_profit: bool = False  # Было true по умолчанию
 
     # EXTREME_SPIKE условия (самые мягкие для быстрых MR)
     extreme_spike_min_profit_pct: float = 0.15
@@ -522,26 +533,59 @@ class TimeExitConfig:
     """
     Улучшение 6: Интеллектуальный Time Exit.
     Aggressive time exit для убыточных и flat позиций.
+
+    CRITICAL FIX v2: aggressive_exits убивает систему (38.5% позиций в убытке).
+    По умолчанию aggressive_exits ОТКЛЮЧЕНЫ. Включайте только после тестирования
+    с мягкими настройками (threshold -0.8%, time 12+ мин, с grace period).
     """
     enabled: bool = True
 
-    # EXTREME_SPIKE (самые строгие time limits)
-    extreme_spike_losing_threshold_pct: float = -0.25
-    extreme_spike_losing_max_minutes: int = 4
+    # =========================================================================
+    # CRITICAL FIX v2: Aggressive exits controls
+    # =========================================================================
+    # Главный выключатель агрессивных time exits (LOSING и FLAT).
+    # ОТКЛЮЧЕНО по умолчанию - причина 38.5% убыточных закрытий.
+    aggressive_exits_enabled: bool = False  # ГЛАВНОЕ ИЗМЕНЕНИЕ - отключено!
+
+    # Отдельный контроль для flat positions (|pnl| < threshold)
+    flat_position_exit_enabled: bool = False  # Отключено - flat может ждать breakout
+
+    # Grace period: не применять aggressive exits первые N минут
+    # Позиции могут быть в минусе сразу после открытия из-за spread/slippage
+    grace_period_minutes: int = 3  # Первые 3 мин - только SL/TP
+
+    # =========================================================================
+    # Conditional mode: закрывать по времени ТОЛЬКО при комбинации факторов
+    # =========================================================================
+    conditional_mode_enabled: bool = False  # По умолчанию отключено
+    conditional_min_loss_pct: float = -0.5  # Мин убыток для срабатывания
+    conditional_require_z_reversal: bool = True  # z должен быть против нас
+    conditional_require_flow_reversal: bool = True  # taker flow против нас
+    conditional_min_time_minutes: int = 8  # Мин время в позиции
+
+    # =========================================================================
+    # EXTREME_SPIKE settings (СМЯГЧЕНЫ в v2)
+    # =========================================================================
+    extreme_spike_losing_threshold_pct: float = -0.8  # Было -0.25, теперь -0.8
+    extreme_spike_losing_max_minutes: int = 12  # Было 4, теперь 12
     extreme_spike_flat_threshold_pct: float = 0.1
     extreme_spike_flat_max_minutes: int = 6
     extreme_spike_max_hold_minutes: int = 20
 
-    # STRONG_SIGNAL
-    strong_signal_losing_threshold_pct: float = -0.30
-    strong_signal_losing_max_minutes: int = 5
+    # =========================================================================
+    # STRONG_SIGNAL settings (СМЯГЧЕНЫ в v2)
+    # =========================================================================
+    strong_signal_losing_threshold_pct: float = -0.9  # Было -0.30, теперь -0.9
+    strong_signal_losing_max_minutes: int = 14  # Было 5, теперь 14
     strong_signal_flat_threshold_pct: float = 0.1
     strong_signal_flat_max_minutes: int = 8
     strong_signal_max_hold_minutes: int = 45
 
-    # EARLY_SIGNAL (самые мягкие)
-    early_signal_losing_threshold_pct: float = -0.35
-    early_signal_losing_max_minutes: int = 6
+    # =========================================================================
+    # EARLY_SIGNAL settings (СМЯГЧЕНЫ в v2)
+    # =========================================================================
+    early_signal_losing_threshold_pct: float = -1.0  # Было -0.35, теперь -1.0
+    early_signal_losing_max_minutes: int = 15  # Было 6, теперь 15
     early_signal_flat_threshold_pct: float = 0.1
     early_signal_flat_max_minutes: int = 10
     early_signal_max_hold_minutes: int = 90
@@ -572,9 +616,19 @@ class MinProfitFilterConfig:
 
 @dataclass
 class PositionManagementConfig:
-    """Virtual position management configuration."""
+    """
+    Virtual position management configuration.
+
+    CRITICAL FIX v2: Added grace_period_minutes to prevent aggressive exits
+    from closing positions that are in temporary drawdown due to spread/slippage.
+    """
     enabled: bool = True
     allow_multiple_positions: bool = False  # Allow multiple positions per symbol
+
+    # CRITICAL FIX v2: Grace period for new positions
+    # Первые N минут не применять aggressive exits (TIME_EXIT_LOSING, TIME_EXIT_FLAT)
+    # Позиции могут быть в минусе сразу после открытия из-за spread/slippage
+    grace_period_minutes: int = 3  # Первые 3 мин - только SL/TP, без aggressive time exits
 
     # Profile selection
     profile: str = "DEFAULT"  # Options: "DEFAULT", "WIN_RATE_MAX"
