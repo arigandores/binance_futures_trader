@@ -281,6 +281,33 @@ class PositionManager:
 
             logger.debug(f"{symbol}: All WIN_RATE_MAX market regime filters PASSED")
 
+        # =====================================================================
+        # CRITICAL FIXES V3: Entry Filters (Fix 5)
+        # Check R:R ratio and minimum ATR before creating pending signal
+        # =====================================================================
+
+        # Fix 5a: Entry R:R Filter
+        rr_passed, rr_reason = self.trading_improvements.check_entry_rr_filter(
+            symbol=symbol,
+            signal_class=signal_class,
+            direction=trade_direction,
+            entry_price=bar.close
+        )
+        if not rr_passed:
+            logger.info(f"{symbol}: Pending signal blocked by R:R filter: {rr_reason}")
+            return
+
+        # Fix 5b: Minimum ATR Filter
+        atr_passed, atr_reason = self.trading_improvements.check_min_atr_filter(
+            symbol=symbol,
+            entry_price=bar.close
+        )
+        if not atr_passed:
+            logger.info(f"{symbol}: Pending signal blocked by min ATR filter: {atr_reason}")
+            return
+
+        logger.debug(f"{symbol}: Critical Fixes v3 entry filters PASSED")
+
         # Create pending signal with TTL (max watch window)
         # Must-Fix #1: Use bar time scale, not event.ts or wall clock
         signal_id = f"{symbol}_{event.event_id}_{event.direction.value}"  # Must-Fix #8: Use event.event_id
@@ -2653,16 +2680,18 @@ class PositionManager:
         """
         Check all exit conditions with CORRECTED priority order.
 
-        CRITICAL FIX v2: Exit priority REORDERED with TIME_EXIT_LOSING moved to LAST:
-        1. Trailing Stop (if activated and hit) - HIGHEST (protect profits)
-        2. Breakeven Stop - SECOND (protect capital at entry)
-        3. Fixed Stop Loss - THIRD (protect from big losses)
-        4. TAKE_PROFIT - FOURTH (lock in target gains)
-        5. Z-Score Reversal - FIFTH (signal ended)
-        6. Order Flow Reversal - SIXTH
-        7. Opposite Signal - SEVENTH
-        8. Max Hold Time Exit - EIGHTH (time limit)
-        9. TIME_EXIT_LOSING - LAST (only if nothing else worked)
+        CRITICAL FIX v3: Exit priority with MAX_LOSS_CAP as ABSOLUTE HIGHEST:
+        0. MAX_LOSS_CAP - ABSOLUTE HIGHEST (hard cap, never exceed -1.2%)
+        1. Trailing Stop v3 (if activated and hit) - protect profits
+        2. Trailing Stop (legacy) - protect profits
+        3. Breakeven Stop - protect capital at entry
+        4. Fixed Stop Loss - protect from big losses
+        5. TAKE_PROFIT - lock in target gains
+        6. Z-Score Reversal (with PnL conditions) - signal ended
+        7. Order Flow Reversal
+        8. Opposite Signal
+        9. Max Hold Time Exit
+        10. TIME_EXIT_LOSING - LAST (only if nothing else worked)
 
         CRITICAL: Grace period check ensures aggressive exits don't fire too early.
         """
@@ -2678,7 +2707,24 @@ class PositionManager:
         in_grace_period = duration_minutes < cfg.grace_period_minutes
 
         # =====================================================================
-        # 1. TRAILING STOP - HIGHEST PRIORITY (protect unrealized gains)
+        # 0. MAX LOSS CAP - ABSOLUTE HIGHEST (Critical Fix v3 - Fix 6)
+        # Hard cap on maximum loss per position, fires before ANY other exit
+        # =====================================================================
+        max_loss_exit = self.trading_improvements.check_max_loss_cap(position, current_price)
+        if max_loss_exit:
+            return max_loss_exit
+
+        # =====================================================================
+        # 0.5. TRAILING STOP V3 - Update and check (Critical Fix v3 - Fix 3)
+        # Earlier and tighter trailing with accelerated mode
+        # =====================================================================
+        self.trading_improvements.update_trailing_stop_v3(position, current_price)
+        trailing_v3_exit = self.trading_improvements.check_trailing_stop_v3_hit(position, current_price)
+        if trailing_v3_exit:
+            return trailing_v3_exit
+
+        # =====================================================================
+        # 1. TRAILING STOP (legacy) - protect unrealized gains
         # =====================================================================
         if position.metrics.get('trailing_stop_active'):
             trailing_stop_price = position.metrics.get('trailing_stop_price')
@@ -2753,6 +2799,21 @@ class PositionManager:
         trading_mode = position.metrics.get('trading_mode')
         original_direction = position.metrics.get('original_direction')
 
+        # =====================================================================
+        # CRITICAL FIX V3: Z-Exit with PnL Conditions (Fix 4)
+        # Only allow z-exit when position is profitable
+        # =====================================================================
+        z_exit_result = self.trading_improvements.check_z_exit_with_pnl_conditions(
+            position=position,
+            current_z_er=features.z_er_15m if features.z_er_15m else 0.0,
+            current_price=current_price,
+            current_ts=bar.ts_minute
+        )
+        if z_exit_result:
+            z_exit_reason, close_pct = z_exit_result
+            return z_exit_reason
+
+        # Fallback to existing z-exit logic for trading modes if v3 didn't trigger
         if trading_mode == 'MEAN_REVERSION':
             # Mean-Reversion: use mode-specific threshold and direction-aware check
             hs_cfg = self.config.hybrid_strategy.mean_reversion
@@ -2763,23 +2824,25 @@ class PositionManager:
                 # For LONG (fading down-spike): exit when z rose to threshold (z >= -threshold)
                 if position.direction == Direction.DOWN:  # Shorting to fade up-spike
                     if features.z_er_15m <= z_threshold:
-                        return ExitReason.Z_SCORE_REVERSAL
+                        # Check PnL condition before exiting
+                        if pnl_pct >= cfg.z_score_exit.min_pnl_for_full_exit if cfg.z_score_exit.enabled else True:
+                            return ExitReason.Z_SCORE_REVERSAL
                 else:  # Long to fade down-spike
                     if features.z_er_15m >= -z_threshold:
-                        return ExitReason.Z_SCORE_REVERSAL
+                        if pnl_pct >= cfg.z_score_exit.min_pnl_for_full_exit if cfg.z_score_exit.enabled else True:
+                            return ExitReason.Z_SCORE_REVERSAL
         elif trading_mode == 'CONDITIONAL_MOMENTUM':
             hs_cfg = self.config.hybrid_strategy.conditional_momentum
             if hs_cfg.use_z_exit and abs(features.z_er_15m) < hs_cfg.z_score_exit_threshold:
-                return ExitReason.Z_SCORE_REVERSAL
+                if pnl_pct >= cfg.z_score_exit.min_pnl_for_full_exit if cfg.z_score_exit.enabled else True:
+                    return ExitReason.Z_SCORE_REVERSAL
         elif trading_mode == 'EARLY_MOMENTUM':
             # Early Momentum: use_z_exit = False by default, skip z-score exit
             hs_cfg = self.config.hybrid_strategy.early_momentum
             if hs_cfg.use_z_exit and abs(features.z_er_15m) < cfg.z_score_exit_threshold:
-                return ExitReason.Z_SCORE_REVERSAL
-        else:
-            # Legacy mode: use standard abs() check
-            if abs(features.z_er_15m) < cfg.z_score_exit_threshold:
-                return ExitReason.Z_SCORE_REVERSAL
+                if pnl_pct >= cfg.z_score_exit.min_pnl_for_full_exit if cfg.z_score_exit.enabled else True:
+                    return ExitReason.Z_SCORE_REVERSAL
+        # Note: Legacy mode z-exit is handled by check_z_exit_with_pnl_conditions above
 
         # =====================================================================
         # 6. ORDER FLOW REVERSAL - SIXTH
@@ -2906,6 +2969,23 @@ class PositionManager:
                 f"Противоположный сигнал: z_ER = {features.z_er_15m:+.2f}σ указывает на {opposite}. "
                 f"Рынок развернулся против позиции. "
                 f"Порог противосигнала: {cfg.opposite_signal_threshold}σ."
+            )
+
+        elif exit_reason == ExitReason.MAX_LOSS_CAP:
+            max_loss = cfg.risk_management.max_loss_per_position.max_loss_pct
+            return (
+                f"КРИТИЧЕСКИЙ СТОП: достигнут лимит убытка -{max_loss:.1f}%. "
+                f"PnL: {pnl_pct:+.2f}% (вход: {format_price(position.open_price)}, "
+                f"выход: {format_price(current_price)}). "
+                f"Защита от катастрофических потерь активирована."
+            )
+
+        elif exit_reason == ExitReason.TRAILING_STOP_V3:
+            trailing_price = position.metrics.get('trailing_stop_v3_price', 0)
+            return (
+                f"Улучшенный трейлинг-стоп V3 сработал: цена {format_price(current_price)} "
+                f"достигла уровня {format_price(trailing_price)}. "
+                f"MFE: {position.max_favorable_excursion:+.2f}%, финальный PnL: {pnl_pct:+.2f}%."
             )
 
         else:

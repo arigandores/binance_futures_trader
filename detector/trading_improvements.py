@@ -897,3 +897,377 @@ class TradingImprovements:
             f"{net_expected:.2f}% >= {min_profit:.2f}%"
         )
         return True, None
+
+    # =========================================================================
+    # CRITICAL FIXES V3: New methods for profitability improvements
+    # =========================================================================
+
+    def check_entry_rr_filter(
+        self,
+        symbol: str,
+        signal_class: Optional[SignalClass],
+        direction: Direction,
+        entry_price: float
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Critical Fix 5: Entry R:R Filter.
+        Check if risk/reward ratio is sufficient to allow entry.
+
+        Calculates R:R as: expected_tp1 / expected_sl
+
+        Returns:
+            Tuple of (passed, block_reason) - passed=True means trade allowed
+        """
+        ef_cfg = self.pm_cfg.entry_filters.min_rr_filter
+
+        if not ef_cfg.enabled:
+            return True, None
+
+        atr = self.extended_features.get_atr(symbol)
+        if atr is None or atr <= 0:
+            logger.debug(f"{symbol}: Entry R:R filter skipped - no ATR available")
+            return True, None
+
+        # Get TP1 level (reward)
+        ttp_cfg = self.pm_cfg.tiered_take_profit
+        asl_cfg = self.pm_cfg.adaptive_stop_loss
+
+        # Determine TP1 ATR multiplier by signal class
+        if signal_class == SignalClass.EXTREME_SPIKE:
+            tp1_atr = ttp_cfg.extreme_spike_tp1_atr
+            sl_atr = asl_cfg.base_multiplier_extreme_spike
+            min_rr = ef_cfg.extreme_spike_min_rr
+        elif signal_class == SignalClass.STRONG_SIGNAL:
+            tp1_atr = ttp_cfg.strong_signal_tp1_atr
+            sl_atr = asl_cfg.base_multiplier_strong_signal
+            min_rr = ef_cfg.strong_signal_min_rr
+        elif signal_class == SignalClass.EARLY_SIGNAL:
+            tp1_atr = ttp_cfg.early_signal_tp1_atr
+            sl_atr = asl_cfg.base_multiplier_early_signal
+            min_rr = ef_cfg.early_signal_min_rr
+        else:
+            tp1_atr = ttp_cfg.strong_signal_tp1_atr
+            sl_atr = asl_cfg.base_multiplier_strong_signal
+            min_rr = ef_cfg.min_rr_ratio
+
+        # Calculate R:R ratio
+        # R:R = TP distance / SL distance
+        if sl_atr <= 0:
+            logger.debug(f"{symbol}: Entry R:R filter skipped - invalid SL multiplier")
+            return True, None
+
+        rr_ratio = tp1_atr / sl_atr
+
+        if rr_ratio < min_rr:
+            reason = (
+                f"R:R too low: TP1={tp1_atr:.2f}xATR / SL={sl_atr:.2f}xATR = "
+                f"{rr_ratio:.2f} < min {min_rr:.2f}"
+            )
+            logger.info(f"{symbol}: Entry R:R filter BLOCKED | {reason}")
+            return False, reason
+
+        logger.debug(
+            f"{symbol}: Entry R:R filter PASSED | "
+            f"TP1={tp1_atr:.2f}xATR / SL={sl_atr:.2f}xATR = {rr_ratio:.2f} >= {min_rr:.2f}"
+        )
+        return True, None
+
+    def check_min_atr_filter(
+        self,
+        symbol: str,
+        entry_price: float
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Critical Fix 5b: Minimum ATR Filter.
+        Check if volatility is sufficient for profitable trades.
+
+        Returns:
+            Tuple of (passed, block_reason) - passed=True means trade allowed
+        """
+        atr_cfg = self.pm_cfg.entry_filters.min_atr_filter
+
+        if not atr_cfg.enabled:
+            return True, None
+
+        atr = self.extended_features.get_atr(symbol)
+        if atr is None:
+            logger.debug(f"{symbol}: Min ATR filter skipped - no ATR available")
+            return True, None
+
+        atr_pct = (atr / entry_price) * 100
+
+        if atr_pct < atr_cfg.min_atr_pct:
+            reason = (
+                f"ATR too low: {atr_pct:.3f}% < min {atr_cfg.min_atr_pct:.2f}%"
+            )
+            logger.info(f"{symbol}: Min ATR filter BLOCKED | {reason}")
+            return False, reason
+
+        logger.debug(
+            f"{symbol}: Min ATR filter PASSED | ATR={atr_pct:.3f}% >= {atr_cfg.min_atr_pct:.2f}%"
+        )
+        return True, None
+
+    def check_max_loss_cap(
+        self,
+        position: Position,
+        current_price: float
+    ) -> Optional[ExitReason]:
+        """
+        Critical Fix 6: Max Loss Cap per Position.
+        Check if position has hit maximum loss cap.
+
+        This is the HIGHEST PRIORITY exit check - fires before any other exit.
+
+        Returns:
+            ExitReason.MAX_LOSS_CAP if cap hit, None otherwise
+        """
+        rm_cfg = self.pm_cfg.risk_management.max_loss_per_position
+
+        if not rm_cfg.enabled:
+            return None
+
+        # Calculate current PnL
+        direction_multiplier = 1 if position.direction == Direction.UP else -1
+        pnl_pct = ((current_price - position.open_price) / position.open_price * 100) * direction_multiplier
+
+        # Check if max loss cap hit
+        if pnl_pct <= -rm_cfg.max_loss_pct:
+            logger.info(
+                f"{position.symbol}: MAX LOSS CAP triggered | "
+                f"PnL={pnl_pct:.2f}% <= -{rm_cfg.max_loss_pct:.2f}% | "
+                f"Action: {rm_cfg.action}"
+            )
+            return ExitReason.MAX_LOSS_CAP
+
+        return None
+
+    def check_z_exit_with_pnl_conditions(
+        self,
+        position: Position,
+        current_z_er: float,
+        current_price: float,
+        current_ts: int
+    ) -> Optional[Tuple[ExitReason, int]]:
+        """
+        Critical Fix 4: Z-Score Exit with PnL Conditions.
+        Only allow z-exit when position is profitable.
+
+        Returns:
+            Tuple of (ExitReason, close_percent) if exit should happen, None otherwise
+        """
+        ze_cfg = self.pm_cfg.z_score_exit
+
+        if not ze_cfg.enabled:
+            return None
+
+        # Get signal class threshold
+        signal_class_str = position.signal_class
+        if signal_class_str == 'EXTREME_SPIKE':
+            z_threshold = ze_cfg.extreme_spike_threshold
+        elif signal_class_str == 'STRONG_SIGNAL':
+            z_threshold = ze_cfg.strong_signal_threshold
+        elif signal_class_str == 'EARLY_SIGNAL':
+            z_threshold = ze_cfg.early_signal_threshold
+        else:
+            z_threshold = ze_cfg.strong_signal_threshold
+
+        # Check if z-score has reversed (below threshold)
+        z_reversed = abs(current_z_er) < z_threshold
+
+        if not z_reversed:
+            # Z-score still strong, no exit
+            return None
+
+        # Z-score reversed - now check PnL conditions
+        direction_multiplier = 1 if position.direction == Direction.UP else -1
+        pnl_pct = ((current_price - position.open_price) / position.open_price * 100) * direction_multiplier
+
+        # Check if position is profitable enough for full exit
+        if pnl_pct >= ze_cfg.min_pnl_for_full_exit:
+            close_pct = 100
+            logger.info(
+                f"{position.symbol}: Z-exit FULL | z={current_z_er:.2f} < {z_threshold:.2f} | "
+                f"PnL={pnl_pct:.2f}% >= {ze_cfg.min_pnl_for_full_exit:.2f}%"
+            )
+            return (ExitReason.Z_SCORE_REVERSAL, close_pct)
+
+        # Check if profitable enough for partial exit
+        if ze_cfg.partial_close_enabled and pnl_pct >= ze_cfg.min_pnl_for_partial_exit:
+            close_pct = ze_cfg.partial_close_percent
+            logger.info(
+                f"{position.symbol}: Z-exit PARTIAL ({close_pct}%) | z={current_z_er:.2f} < {z_threshold:.2f} | "
+                f"PnL={pnl_pct:.2f}% >= {ze_cfg.min_pnl_for_partial_exit:.2f}%"
+            )
+            return (ExitReason.Z_SCORE_REVERSAL, close_pct)
+
+        # Position is losing - check behavior configuration
+        if ze_cfg.require_positive_pnl:
+            # Track when z-reversal started (for max_additional_hold_minutes)
+            z_reversal_start = position.metrics.get('z_reversal_start_ts')
+
+            if z_reversal_start is None:
+                # First time z-reversed while losing - record timestamp
+                position.metrics['z_reversal_start_ts'] = current_ts
+                logger.debug(
+                    f"{position.symbol}: Z-reversal detected while losing | "
+                    f"PnL={pnl_pct:.2f}% | Holding for max {ze_cfg.max_additional_hold_minutes}m"
+                )
+                return None  # Hold position
+
+            # Check if we've exceeded max additional hold time
+            hold_minutes = (current_ts - z_reversal_start) // (60 * 1000)
+
+            if hold_minutes >= ze_cfg.max_additional_hold_minutes:
+                # Max hold time exceeded - fall back to trailing or SL
+                logger.info(
+                    f"{position.symbol}: Z-exit hold period expired | "
+                    f"held {hold_minutes}m >= max {ze_cfg.max_additional_hold_minutes}m | "
+                    f"Falling back to {ze_cfg.fallback_exit}"
+                )
+                # Don't return z-exit, let other exit conditions handle it
+                return None
+
+            logger.debug(
+                f"{position.symbol}: Z-reversal hold | "
+                f"PnL={pnl_pct:.2f}% | held {hold_minutes}m / {ze_cfg.max_additional_hold_minutes}m"
+            )
+            return None  # Continue holding
+
+        # Not requiring positive PnL - just use standard behavior
+        return None
+
+    def calculate_trailing_stop_v3(
+        self,
+        position: Position,
+        current_price: float
+    ) -> Optional[float]:
+        """
+        Critical Fix 3: Earlier and Tighter Trailing Stop.
+        Calculate class-aware trailing stop with accelerated mode.
+
+        Returns:
+            New trailing stop price, or None if not activated
+        """
+        ts_cfg = self.pm_cfg.trailing_stop_v3
+
+        if not ts_cfg.enabled:
+            return None
+
+        # Get ATR for distance calculation
+        atr = self.extended_features.get_atr(position.symbol)
+        if atr is None or atr <= 0:
+            return None
+
+        # Get current PnL for activation check
+        direction_multiplier = 1 if position.direction == Direction.UP else -1
+        pnl_pct = ((current_price - position.open_price) / position.open_price * 100) * direction_multiplier
+
+        # Get class-specific settings
+        signal_class_str = position.signal_class
+        if signal_class_str == 'EXTREME_SPIKE':
+            profit_threshold = ts_cfg.extreme_spike_profit_threshold_pct
+            distance_atr = ts_cfg.extreme_spike_distance_atr
+        elif signal_class_str == 'STRONG_SIGNAL':
+            profit_threshold = ts_cfg.strong_signal_profit_threshold_pct
+            distance_atr = ts_cfg.strong_signal_distance_atr
+        elif signal_class_str == 'EARLY_SIGNAL':
+            profit_threshold = ts_cfg.early_signal_profit_threshold_pct
+            distance_atr = ts_cfg.early_signal_distance_atr
+        else:
+            profit_threshold = ts_cfg.strong_signal_profit_threshold_pct
+            distance_atr = ts_cfg.strong_signal_distance_atr
+
+        # Check if position is profitable enough to activate trailing
+        if pnl_pct < profit_threshold:
+            return None
+
+        # Check accelerated trailing
+        accel_cfg = ts_cfg.accelerated_trailing
+        if accel_cfg.enabled and pnl_pct >= accel_cfg.trigger_profit_pct:
+            # Apply tighter distance
+            distance_atr *= accel_cfg.tighter_distance_multiplier
+            logger.debug(
+                f"{position.symbol}: Accelerated trailing active | "
+                f"PnL={pnl_pct:.2f}% >= {accel_cfg.trigger_profit_pct:.2f}% | "
+                f"distance reduced by {(1-accel_cfg.tighter_distance_multiplier)*100:.0f}%"
+            )
+
+        # Calculate trailing stop price
+        trail_distance = atr * distance_atr
+
+        if position.direction == Direction.UP:
+            # For longs, stop trails below price
+            new_stop = current_price - trail_distance
+            # Only update if higher than current stop
+            current_stop = position.metrics.get('trailing_stop_v3_price')
+            if current_stop is not None and new_stop <= current_stop:
+                return None  # Don't lower the stop
+        else:
+            # For shorts, stop trails above price
+            new_stop = current_price + trail_distance
+            # Only update if lower than current stop
+            current_stop = position.metrics.get('trailing_stop_v3_price')
+            if current_stop is not None and new_stop >= current_stop:
+                return None  # Don't raise the stop
+
+        logger.debug(
+            f"{position.symbol}: Trailing stop v3 updated | "
+            f"PnL={pnl_pct:.2f}% | distance={distance_atr:.2f}xATR | "
+            f"new_stop={new_stop:.6f}"
+        )
+
+        return new_stop
+
+    def check_trailing_stop_v3_hit(
+        self,
+        position: Position,
+        current_price: float
+    ) -> Optional[ExitReason]:
+        """
+        Check if trailing stop v3 has been hit.
+
+        Returns:
+            ExitReason.TRAILING_STOP_V3 if hit, None otherwise
+        """
+        ts_cfg = self.pm_cfg.trailing_stop_v3
+
+        if not ts_cfg.enabled:
+            return None
+
+        # Get current trailing stop price
+        trailing_stop_price = position.metrics.get('trailing_stop_v3_price')
+        if trailing_stop_price is None:
+            return None
+
+        # Check if hit
+        if position.direction == Direction.UP:
+            if current_price <= trailing_stop_price:
+                logger.info(
+                    f"{position.symbol}: Trailing stop v3 HIT | "
+                    f"price={current_price:.6f} <= stop={trailing_stop_price:.6f}"
+                )
+                return ExitReason.TRAILING_STOP_V3
+        else:
+            if current_price >= trailing_stop_price:
+                logger.info(
+                    f"{position.symbol}: Trailing stop v3 HIT | "
+                    f"price={current_price:.6f} >= stop={trailing_stop_price:.6f}"
+                )
+                return ExitReason.TRAILING_STOP_V3
+
+        return None
+
+    def update_trailing_stop_v3(
+        self,
+        position: Position,
+        current_price: float
+    ) -> None:
+        """
+        Update trailing stop v3 price for position.
+        Called on every bar.
+        """
+        new_stop = self.calculate_trailing_stop_v3(position, current_price)
+        if new_stop is not None:
+            position.metrics['trailing_stop_v3_price'] = new_stop
+            position.metrics['trailing_stop_v3_active'] = True

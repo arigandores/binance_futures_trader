@@ -384,6 +384,9 @@ class ExitReason(str, Enum):
     OPPOSITE_SIGNAL = "OPPOSITE_SIGNAL"  # Strong opposite direction signal
     ORDER_FLOW_REVERSAL = "ORDER_FLOW_REVERSAL"  # Taker buy/sell ratio reversed
     TRAILING_STOP = "TRAILING_STOP"  # Trailing stop triggered after reaching profit target
+    # Critical Fixes v3 - new exit reasons
+    MAX_LOSS_CAP = "MAX_LOSS_CAP"  # Max loss per position cap hit (Fix 6)
+    TRAILING_STOP_V3 = "TRAILING_STOP_V3"  # Enhanced trailing stop v3 (Fix 3)
 
 
 @dataclass

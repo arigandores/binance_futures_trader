@@ -614,6 +614,141 @@ class MinProfitFilterConfig:
     early_signal_min_profit_pct: float = 0.40
 
 
+# =========================================================================
+# CRITICAL FIXES V3: New config dataclasses for profitability improvements
+# Based on critical_fixes_v3_specification.md
+# =========================================================================
+
+@dataclass
+class ZScoreExitConfig:
+    """
+    Critical Fix 4: Z-Score Exit только в прибыли.
+    Prevents closing losing positions on z-score reversal.
+    """
+    enabled: bool = True
+
+    # Base thresholds (per signal class)
+    extreme_spike_threshold: float = 1.5
+    strong_signal_threshold: float = 0.8
+    early_signal_threshold: float = 0.8
+
+    # NEW: PnL conditions for z-exit
+    require_positive_pnl: bool = True  # Only exit if PnL >= 0
+    min_pnl_for_full_exit: float = 0.15  # Full exit if PnL >= 0.15%
+    min_pnl_for_partial_exit: float = 0.0  # Partial exit if PnL >= 0%
+
+    # Behavior when position is losing
+    behavior_when_losing_action: str = "hold"  # "hold" or "ignore"
+    max_additional_hold_minutes: int = 5  # Max extra hold time after z-reversal
+    fallback_exit: str = "trailing_or_sl"  # What happens after max hold
+
+    # Partial close by z-score
+    partial_close_enabled: bool = True
+    partial_close_percent: int = 60  # Close 60% on z-exit
+    hold_remainder_for_trailing: bool = True
+
+
+@dataclass
+class EntryRRFilterConfig:
+    """
+    Critical Fix 5: Entry R:R Filter.
+    Don't open positions with poor risk/reward ratio.
+    """
+    enabled: bool = True
+
+    # R:R calculation basis
+    expected_tp: str = "tp1"  # Calculate R:R against TP1 (most likely)
+    expected_sl: str = "adaptive_sl"  # Use adaptive SL
+
+    # Global minimum R:R (if by_class disabled)
+    min_rr_ratio: float = 0.8
+
+    # Per-class minimums (different requirements)
+    extreme_spike_min_rr: float = 0.8  # MR can have lower R:R but higher WR
+    strong_signal_min_rr: float = 1.0
+    early_signal_min_rr: float = 1.2  # Early needs better R:R
+
+
+@dataclass
+class MinATRFilterConfig:
+    """
+    Critical Fix 5b: Minimum ATR Filter.
+    Filter out low-volatility situations where profit potential is too small.
+    """
+    enabled: bool = True
+    min_atr_pct: float = 0.3  # Minimum ATR as % of price
+
+
+@dataclass
+class EntryFiltersConfig:
+    """
+    Critical Fix 5: Combined Entry Filters.
+    """
+    min_rr_filter: EntryRRFilterConfig = field(default_factory=EntryRRFilterConfig)
+    min_atr_filter: MinATRFilterConfig = field(default_factory=MinATRFilterConfig)
+
+
+@dataclass
+class MaxLossPerPositionConfig:
+    """
+    Critical Fix 6: Max Loss Cap per Position.
+    Hard cap on maximum loss for any single position.
+    """
+    enabled: bool = True
+    max_loss_pct: float = 1.2  # Maximum -1.2% per position
+    action: str = "immediate_close"  # Close immediately when hit
+
+
+@dataclass
+class RiskManagementConfig:
+    """
+    Critical Fix 6: Risk Management configuration.
+    """
+    max_loss_per_position: MaxLossPerPositionConfig = field(default_factory=MaxLossPerPositionConfig)
+
+
+@dataclass
+class TrailingStopV3ClassConfig:
+    """Trailing stop configuration for a single signal class."""
+    profit_threshold_pct: float = 0.25
+    distance_atr: float = 0.5
+
+
+@dataclass
+class AcceleratedTrailingConfig:
+    """Accelerated trailing when position is well in profit."""
+    enabled: bool = True
+    trigger_profit_pct: float = 0.5  # Activate at +0.5% profit
+    tighter_distance_multiplier: float = 0.7  # Trail becomes 30% tighter
+
+
+@dataclass
+class TrailingStopV3Config:
+    """
+    Critical Fix 3: Earlier and Tighter Trailing Stop.
+    Class-aware trailing with accelerated mode.
+    """
+    enabled: bool = True
+
+    # Per-class activation settings
+    extreme_spike_profit_threshold_pct: float = 0.15  # Was 0.25
+    extreme_spike_distance_atr: float = 0.25  # Was 0.5
+
+    strong_signal_profit_threshold_pct: float = 0.20  # Was 0.35
+    strong_signal_distance_atr: float = 0.35  # Was 0.7
+
+    early_signal_profit_threshold_pct: float = 0.25  # Was 0.45
+    early_signal_distance_atr: float = 0.5  # Was 1.0
+
+    # Behavior
+    activate_on_tp1: bool = True  # Was on_tp2
+    update_frequency: str = "every_bar"
+    use_close_price: bool = True
+
+    # Accelerated trailing (NEW)
+    accelerated_trailing: AcceleratedTrailingConfig = field(default_factory=AcceleratedTrailingConfig)
+
+
 @dataclass
 class PositionManagementConfig:
     """
@@ -680,6 +815,12 @@ class PositionManagementConfig:
     trailing_stop_by_class: TrailingStopByClassConfig = field(default_factory=TrailingStopByClassConfig)
     time_exit: TimeExitConfig = field(default_factory=TimeExitConfig)
     min_profit_filter: MinProfitFilterConfig = field(default_factory=MinProfitFilterConfig)
+
+    # =========== CRITICAL FIXES V3 (6 исправлений для прибыльности) ===========
+    z_score_exit: ZScoreExitConfig = field(default_factory=ZScoreExitConfig)
+    entry_filters: EntryFiltersConfig = field(default_factory=EntryFiltersConfig)
+    risk_management: RiskManagementConfig = field(default_factory=RiskManagementConfig)
+    trailing_stop_v3: TrailingStopV3Config = field(default_factory=TrailingStopV3Config)
 
 
 @dataclass
@@ -780,6 +921,26 @@ class Config:
                 pm_data['time_exit'] = TimeExitConfig(**pm_data['time_exit'])
             if 'min_profit_filter' in pm_data:
                 pm_data['min_profit_filter'] = MinProfitFilterConfig(**pm_data['min_profit_filter'])
+            # Parse Critical Fixes v3 configs
+            if 'z_score_exit' in pm_data:
+                pm_data['z_score_exit'] = ZScoreExitConfig(**pm_data['z_score_exit'])
+            if 'entry_filters' in pm_data:
+                ef_data = pm_data['entry_filters'].copy()
+                if 'min_rr_filter' in ef_data:
+                    ef_data['min_rr_filter'] = EntryRRFilterConfig(**ef_data['min_rr_filter'])
+                if 'min_atr_filter' in ef_data:
+                    ef_data['min_atr_filter'] = MinATRFilterConfig(**ef_data['min_atr_filter'])
+                pm_data['entry_filters'] = EntryFiltersConfig(**ef_data)
+            if 'risk_management' in pm_data:
+                rm_data = pm_data['risk_management'].copy()
+                if 'max_loss_per_position' in rm_data:
+                    rm_data['max_loss_per_position'] = MaxLossPerPositionConfig(**rm_data['max_loss_per_position'])
+                pm_data['risk_management'] = RiskManagementConfig(**rm_data)
+            if 'trailing_stop_v3' in pm_data:
+                ts_data = pm_data['trailing_stop_v3'].copy()
+                if 'accelerated_trailing' in ts_data:
+                    ts_data['accelerated_trailing'] = AcceleratedTrailingConfig(**ts_data['accelerated_trailing'])
+                pm_data['trailing_stop_v3'] = TrailingStopV3Config(**ts_data)
             config.position_management = PositionManagementConfig(**pm_data)
 
         # Parse hybrid_strategy configuration
