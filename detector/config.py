@@ -433,7 +433,8 @@ class TieredTakeProfitConfig:
 
     # Actions после достижения уровней
     move_sl_breakeven_on_tp1: bool = True  # Перенести SL в breakeven после TP1
-    activate_trailing_on_tp2: bool = True   # Активировать trailing после TP2
+    activate_trailing_on_tp1: bool = True   # Critical Fix v3: Активировать trailing после TP1
+    activate_trailing_on_tp2: bool = False  # Legacy: Активировать trailing после TP2 (disabled if tp1 enabled)
 
 
 @dataclass
