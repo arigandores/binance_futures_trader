@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+import time
 import aiohttp
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 
 from detector.utils import format_price
@@ -73,6 +74,10 @@ class PositionManager:
         # Telegram session
         self.telegram_session: Optional[aiohttp.ClientSession] = None
 
+        # Periodic stats tracking
+        self._start_time: float = time.monotonic()
+        self._stats_interval_seconds: int = 6 * 60 * 60  # 6 hours
+
     async def init(self) -> None:
         """Initialize by loading open positions from database."""
         positions = await self.storage.get_open_positions()
@@ -96,7 +101,8 @@ class PositionManager:
             asyncio.create_task(self._handle_alerts()),
             asyncio.create_task(self._handle_features()),
             asyncio.create_task(self._handle_bars()),
-            asyncio.create_task(self._cleanup_expired_pending_signals())  # NEW
+            asyncio.create_task(self._cleanup_expired_pending_signals()),
+            asyncio.create_task(self._periodic_stats_report()),
         ]
 
         try:
@@ -3164,8 +3170,13 @@ class PositionManager:
             ts: Timestamp in milliseconds
             metadata: Additional data to store
         """
-        # Send to Telegram if enabled
-        if self.config.alerts.telegram.enabled:
+        # Only send position-related alerts to Telegram (not signal noise)
+        TELEGRAM_ALERT_TYPES = {
+            "POSITION_OPENED",
+            "POSITION_CLOSED",
+            "PARTIAL_PROFIT_EXECUTED",
+        }
+        if self.config.alerts.telegram.enabled and alert_type in TELEGRAM_ALERT_TYPES:
             await self._send_telegram(message)
 
         # Always save to database for audit
@@ -3178,6 +3189,100 @@ class PositionManager:
             message_text=message,
             metadata=metadata
         )
+
+    async def _periodic_stats_report(self) -> None:
+        """Send position statistics to Telegram every 6 hours."""
+        while True:
+            try:
+                await asyncio.sleep(self._stats_interval_seconds)
+                logger.info("Generating periodic position statistics report")
+                message = await self._build_stats_report()
+                if message and self.config.alerts.telegram.enabled:
+                    await self._send_telegram(message)
+                    logger.info("Periodic stats report sent to Telegram")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic stats report: {e}")
+
+    async def _build_stats_report(self) -> Optional[str]:
+        """Build position statistics message for Telegram."""
+        open_positions = await self.storage.get_open_positions()
+        closed_positions = await self.storage.query_positions(
+            status=PositionStatus.CLOSED, limit=500
+        )
+
+        uptime_seconds = time.monotonic() - self._start_time
+        uptime_hours = uptime_seconds / 3600
+
+        lines: List[str] = []
+        lines.append("📊 <b>POSITION STATS (6h report)</b>")
+        lines.append(f"⏱ Uptime: {uptime_hours:.1f}h")
+        lines.append("")
+
+        # Open positions
+        lines.append(f"📈 <b>Open positions: {len(open_positions)}</b>")
+        for pos in open_positions:
+            dur_min = (int(datetime.now().timestamp() * 1000) - pos.open_ts) // (60 * 1000)
+            lines.append(
+                f"  • {pos.symbol} {pos.direction.value} | "
+                f"entry {format_price(pos.open_price)} | "
+                f"MFE {pos.max_favorable_excursion:+.2f}% | "
+                f"MAE {pos.max_adverse_excursion:+.2f}% | "
+                f"{dur_min}m"
+            )
+        if not open_positions:
+            lines.append("  No open positions")
+
+        lines.append("")
+
+        # Closed positions summary
+        if closed_positions:
+            total_pnl = sum(p.pnl_percent for p in closed_positions if p.pnl_percent is not None)
+            winning = [p for p in closed_positions if p.pnl_percent and p.pnl_percent > 0]
+            losing = [p for p in closed_positions if p.pnl_percent and p.pnl_percent <= 0]
+            win_rate = (len(winning) / len(closed_positions) * 100) if closed_positions else 0
+            avg_win = (sum(p.pnl_percent for p in winning) / len(winning)) if winning else 0
+            avg_loss = (sum(p.pnl_percent for p in losing) / len(losing)) if losing else 0
+            avg_dur = (
+                sum(p.duration_minutes for p in closed_positions if p.duration_minutes) / len(closed_positions)
+            ) if closed_positions else 0
+
+            lines.append(f"💰 <b>Closed positions: {len(closed_positions)}</b>")
+            lines.append(f"  Win rate: {win_rate:.1f}% ({len(winning)}W / {len(losing)}L)")
+            lines.append(f"  Total PnL: <b>{total_pnl:+.2f}%</b>")
+            lines.append(f"  Avg win: {avg_win:+.2f}%")
+            lines.append(f"  Avg loss: {avg_loss:+.2f}%")
+            lines.append(f"  Avg duration: {avg_dur:.0f}m")
+
+            # Exit reason breakdown
+            exit_counts: Dict[str, int] = {}
+            for p in closed_positions:
+                if p.exit_reason:
+                    reason = p.exit_reason.value
+                    exit_counts[reason] = exit_counts.get(reason, 0) + 1
+
+            if exit_counts:
+                lines.append("")
+                lines.append("🚪 <b>Exit reasons:</b>")
+                for reason, count in sorted(exit_counts.items(), key=lambda x: -x[1]):
+                    pct = (count / len(closed_positions)) * 100
+                    lines.append(f"  {reason}: {count} ({pct:.0f}%)")
+
+            # Last 5 closed positions
+            lines.append("")
+            lines.append("📋 <b>Recent trades (last 5):</b>")
+            for pos in closed_positions[:5]:
+                icon = "✅" if pos.pnl_percent and pos.pnl_percent > 0 else "❌"
+                exit_name = pos.exit_reason.value if pos.exit_reason else "N/A"
+                lines.append(
+                    f"  {icon} {pos.symbol} {pos.direction.value} | "
+                    f"PnL: {pos.pnl_percent:+.2f}% | {exit_name}"
+                )
+        else:
+            lines.append("💰 No closed positions yet")
+
+        return "\n".join(lines)
 
     def _build_market_context(self, symbol: str, bar: Optional[Bar] = None) -> dict:
         """
