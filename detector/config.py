@@ -22,9 +22,7 @@ class ApiConfig:
 class UniverseConfig:
     """Symbol universe configuration."""
     benchmark_symbol: str = "BTCUSDT"
-    symbols: List[str] = field(default_factory=lambda: [
-        "ZECUSDT", "DASHUSDT", "XMRUSDT"
-    ])
+    symbols: List[str] = field(default_factory=list)  # Must be specified in config.yaml
 
     @property
     def all_symbols(self) -> List[str]:

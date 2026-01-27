@@ -913,7 +913,10 @@ class TradingImprovements:
         Critical Fix 5: Entry R:R Filter.
         Check if risk/reward ratio is sufficient to allow entry.
 
-        Calculates R:R as: expected_tp1 / expected_sl
+        Uses the configured expected_tp level for R:R calculation:
+        - "tp1": TP1 only (partial close target) - too strict with tiered TP
+        - "tp3": TP3 (full profit target) - recommended with tiered TP
+        - "weighted": Weighted average across all TP levels
 
         Returns:
             Tuple of (passed, block_reason) - passed=True means trade allowed
@@ -928,39 +931,75 @@ class TradingImprovements:
             logger.debug(f"{symbol}: Entry R:R filter skipped - no ATR available")
             return True, None
 
-        # Get TP1 level (reward)
         ttp_cfg = self.pm_cfg.tiered_take_profit
         asl_cfg = self.pm_cfg.adaptive_stop_loss
 
-        # Determine TP1 ATR multiplier by signal class
+        # Determine TP and SL ATR multipliers by signal class
         if signal_class == SignalClass.EXTREME_SPIKE:
             tp1_atr = ttp_cfg.extreme_spike_tp1_atr
+            tp2_atr = ttp_cfg.extreme_spike_tp2_atr
+            tp3_atr = ttp_cfg.extreme_spike_tp3_atr
+            tp1_pct = ttp_cfg.extreme_spike_tp1_close_pct
+            tp2_pct = ttp_cfg.extreme_spike_tp2_close_pct
+            tp3_pct = ttp_cfg.extreme_spike_tp3_close_pct
             sl_atr = asl_cfg.base_multiplier_extreme_spike
             min_rr = ef_cfg.extreme_spike_min_rr
         elif signal_class == SignalClass.STRONG_SIGNAL:
             tp1_atr = ttp_cfg.strong_signal_tp1_atr
+            tp2_atr = ttp_cfg.strong_signal_tp2_atr
+            tp3_atr = ttp_cfg.strong_signal_tp3_atr
+            tp1_pct = ttp_cfg.strong_signal_tp1_close_pct
+            tp2_pct = ttp_cfg.strong_signal_tp2_close_pct
+            tp3_pct = ttp_cfg.strong_signal_tp3_close_pct
             sl_atr = asl_cfg.base_multiplier_strong_signal
             min_rr = ef_cfg.strong_signal_min_rr
         elif signal_class == SignalClass.EARLY_SIGNAL:
             tp1_atr = ttp_cfg.early_signal_tp1_atr
+            tp2_atr = ttp_cfg.early_signal_tp2_atr
+            tp3_atr = ttp_cfg.early_signal_tp3_atr
+            tp1_pct = ttp_cfg.early_signal_tp1_close_pct
+            tp2_pct = ttp_cfg.early_signal_tp2_close_pct
+            tp3_pct = ttp_cfg.early_signal_tp3_close_pct
             sl_atr = asl_cfg.base_multiplier_early_signal
             min_rr = ef_cfg.early_signal_min_rr
         else:
             tp1_atr = ttp_cfg.strong_signal_tp1_atr
+            tp2_atr = ttp_cfg.strong_signal_tp2_atr
+            tp3_atr = ttp_cfg.strong_signal_tp3_atr
+            tp1_pct = ttp_cfg.strong_signal_tp1_close_pct
+            tp2_pct = ttp_cfg.strong_signal_tp2_close_pct
+            tp3_pct = ttp_cfg.strong_signal_tp3_close_pct
             sl_atr = asl_cfg.base_multiplier_strong_signal
             min_rr = ef_cfg.min_rr_ratio
 
-        # Calculate R:R ratio
-        # R:R = TP distance / SL distance
         if sl_atr <= 0:
             logger.debug(f"{symbol}: Entry R:R filter skipped - invalid SL multiplier")
             return True, None
 
-        rr_ratio = tp1_atr / sl_atr
+        # Select TP level for R:R calculation based on config
+        tp_mode = ef_cfg.expected_tp
+        if tp_mode == "tp3":
+            # Use full profit target (recommended with tiered TP)
+            tp_atr = tp3_atr
+            tp_label = "TP3"
+        elif tp_mode == "weighted":
+            # Weighted average across all TP levels
+            total_pct = tp1_pct + tp2_pct + tp3_pct
+            if total_pct > 0:
+                tp_atr = (tp1_atr * tp1_pct + tp2_atr * tp2_pct + tp3_atr * tp3_pct) / total_pct
+            else:
+                tp_atr = tp3_atr
+            tp_label = "TP_weighted"
+        else:
+            # Default: tp1 (original behavior)
+            tp_atr = tp1_atr
+            tp_label = "TP1"
+
+        rr_ratio = tp_atr / sl_atr
 
         if rr_ratio < min_rr:
             reason = (
-                f"R:R too low: TP1={tp1_atr:.2f}xATR / SL={sl_atr:.2f}xATR = "
+                f"R:R too low: {tp_label}={tp_atr:.2f}xATR / SL={sl_atr:.2f}xATR = "
                 f"{rr_ratio:.2f} < min {min_rr:.2f}"
             )
             logger.info(f"{symbol}: Entry R:R filter BLOCKED | {reason}")
@@ -968,7 +1007,7 @@ class TradingImprovements:
 
         logger.debug(
             f"{symbol}: Entry R:R filter PASSED | "
-            f"TP1={tp1_atr:.2f}xATR / SL={sl_atr:.2f}xATR = {rr_ratio:.2f} >= {min_rr:.2f}"
+            f"{tp_label}={tp_atr:.2f}xATR / SL={sl_atr:.2f}xATR = {rr_ratio:.2f} >= {min_rr:.2f}"
         )
         return True, None
 
